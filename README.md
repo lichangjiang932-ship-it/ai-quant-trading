@@ -37,6 +37,91 @@
 - **新闻情感**: 多源 + 情感评分 + 行业排名 + 龙虎榜
 - **市场监控**: 涨跌停告警、异常波动监控
 
+---
+
+## 部署指南（新机器从零跑起来）
+
+主界面是 **AI 量化交易驾驶舱**（FastAPI + 单页前端），提供实时行情、分时/日 K 图、AI 自动选股、自选股、模拟下单。以下是在一台干净的电脑上把它跑起来的完整步骤。
+
+### 1. 前置要求
+
+- **Python 3.11**（建议 3.10–3.12）。确认：`python --version`
+- **Git**（用于克隆）。
+- **国内网络直连**：行情走东方财富 / 腾讯 / 通达信(mootdx TCP)，需要能直连境内接口，**不要挂代理/VPN**（否则东财接口会连不上）。
+
+### 2. 克隆代码
+
+```bash
+git clone https://github.com/lichangjiang932-ship-it/ai-quant-trading.git
+cd ai-quant-trading
+```
+
+### 3. 创建虚拟环境并安装依赖
+
+```bash
+# Windows (PowerShell)
+python -m venv venv
+venv\Scripts\activate
+
+# macOS / Linux
+python3 -m venv venv
+source venv/bin/activate
+
+pip install -r requirements.txt
+```
+
+> `curl_cffi` 是**关键依赖**（以 Chrome TLS 指纹绕过东财对 Python 的屏蔽），已在 `requirements.txt` 中，务必装上，否则资金流/涨停池/北向等接口会超时返回空。
+
+### 4. 生成配置文件
+
+配置文件不在仓库里（含个人设置，已被 `.gitignore` 排除），需从模板复制一份：
+
+```bash
+# Windows
+copy config\config.example.yaml config\config.yaml
+# macOS / Linux
+cp config/config.example.yaml config/config.yaml
+```
+
+行情、自选股、模拟盘**无需密钥即可运行**。仅当你要用 **AI 自动选股 / 多智能体分析**（调用大模型）时，才需要下一步配置 API Key。
+
+### 5. （可选）配置 AI 大模型密钥
+
+AI 选股默认走 **DeepSeek**。在项目根目录新建 `.env` 文件（同样已被 gitignore，不会上传）：
+
+```bash
+# .env
+DEEPSEEK_API_KEY=你的_deepseek_api_key
+```
+
+> Key 在 https://platform.deepseek.com 注册充值后创建。不配也能用平台的其它全部功能，只是 AI 选股会分析失败并转为观望提示。
+
+### 6. 启动驾驶舱
+
+```bash
+python frontend/api_server.py
+```
+
+启动后浏览器打开 **http://localhost:8080** 即可使用：
+
+- 顶部搜索任意 A 股（代码或名称，如 `600519` / `贵州茅台`）
+- 「交易」页标题右侧 **☆ 加自选**，收藏的股票会出现在首页「自选行情」并持久化到 `config.yaml`
+- K 线图右上角切换 **分时 / 日K**，分时图盘中每 20 秒实时刷新
+- 「AI 选股」页点 **开始AI选股**，AI 从全市场热门股漏斗筛选 → 多智能体深度分析 → 给出买入计划，可一键确认下到模拟盘（经硬风控）
+
+> 端口可在 `config/config.yaml` 的 `server.port` 修改（默认 8080）。
+
+### 常见问题
+
+| 现象 | 原因 / 解决 |
+|---|---|
+| 行情/资金流查询转圈或返回空 | 检查 `curl_cffi` 是否装上；关闭代理/VPN 直连境内 |
+| AI 选股全部“分析失败/观望” | `.env` 未配 `DEEPSEEK_API_KEY` 或余额不足 |
+| 端口 8080 被占用 | 改 `config/config.yaml` 的 `server.port` |
+| 克隆后没有 `config.yaml` / `.env` | 正常，按第 4、5 步从模板生成（敏感文件不入库） |
+
+---
+
 ## 项目结构
 
 ```
