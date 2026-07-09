@@ -832,38 +832,48 @@ def update_account(body: dict):
 
 
 @app.get("/api/strategies")
-def get_strategies():
-    """获取策略运行数据"""
-    symbols = config.get('trading.symbols', ['sh600000', 'sz000001', 'sh600104', 'sz000002'])
-    # 腾讯源优先（带完整字段含 name/PE/PB），pytdx name 有编码问题
-    sources = ['tencent', 'sina', 'eastmoney']
-    quotes = realtime.get_quotes([_normalize_symbol(s) for s in symbols], sources=sources)
+def get_strategies(strategy: str = Query("cross_ma")):
+    """策略运行面板: 对自选股每只跑【真实历史回测】, 返回真实收益/胜率/回撤/交易数/当前信号。
+    strategy 可选 cross_ma / momentum / mean_reversion。不再用任何假数据。"""
+    if strategy not in STRATEGY_LABELS:
+        strategy = "cross_ma"
+    syms = _get_watchlist()[:8]
+    params, label = _default_params(strategy, 5, 20)
+    quotes = realtime.get_quotes(syms, sources=['tencent', 'sina']) or {}
+
+    def _one(sym):
+        closes, dates = _load_daily_closes(sym, 180)
+        if len(closes) < 25:
+            return {
+                "name": label, "symbol": sym,
+                "stock_name": quotes.get(sym, {}).get('name') or COMMON_SYMBOL_NAMES.get(sym, sym),
+                "pnl_pct": 0, "win_rate": 0, "max_dd": 0, "trades": 0,
+                "buy_hold": 0, "signal": "无数据", "action": "hold", "available": False,
+            }
+        res = _run_strategy_backtest(closes, dates, strategy, params)
+        # 当前信号 = 最后一根K线的真实动作(金叉/死叉/超买超卖)
+        last_sig = _signal_at(closes, len(closes) - 1, strategy, params)
+        sig_label = {"buy": "买入", "sell": "卖出"}.get(last_sig, "观望")
+        return {
+            "name": label,
+            "symbol": sym,
+            "stock_name": quotes.get(sym, {}).get('name') or COMMON_SYMBOL_NAMES.get(sym, sym),
+            "pnl_pct": res["return_pct"],
+            "win_rate": round(res["win_rate"] / 100, 3),
+            "max_dd": -abs(res["max_drawdown"]),
+            "trades": len([t for t in res["trades"] if t.get('side') == 'sell']),
+            "buy_hold": res["buy_hold_return"],
+            "signal": sig_label,
+            "action": last_sig or "hold",
+            "available": True,
+        }
 
     strategies = []
-    strategy_names = {
-        'sh600000': 'CrossMA',
-        'sz000001': 'Momentum',
-        'sh600104': 'MeanReversion',
-        'sz000002': 'MultiFactor',
-    }
+    if syms:
+        with _Pool(max_workers=min(6, len(syms))) as ex:
+            strategies = list(ex.map(_one, syms))
+    return JSONResponse({"strategy": strategy, "label": label, "items": strategies})
 
-    for i, sym in enumerate(symbols[:4]):
-        sym = _normalize_symbol(sym)
-        q = quotes.get(sym, {})
-        change_pct = float(q.get('change_pct', 0) or 0)
-        name = strategy_names.get(sym, f'Strategy_{i+1}')
-        strategies.append({
-            "name": name,
-            "symbol": sym,
-            "pnl_pct": round(change_pct, 2),
-            "win_rate": round(0.5 + change_pct * 0.01, 3) if change_pct else 0.5,
-            "max_dd": round(-abs(change_pct) * 0.5, 2) if change_pct else -0.5,
-            "run_hours": 24 + i * 24,
-            "signal": "买入" if change_pct > 0 else ("卖出" if change_pct < -1 else "观望"),
-            "action": "buy" if change_pct > 0 else ("sell" if change_pct < -1 else "hold"),
-        })
-
-    return JSONResponse(strategies)
 
 
 @app.get("/api/ai_signals")
@@ -1204,106 +1214,196 @@ def get_market_sentiment():
     return JSONResponse(payload)
 
 
-@app.get("/api/backtest")
-def run_backtest(
-    symbol: str = Query("sh600000"),
-    fast: int = Query(5, ge=2, le=60),
-    slow: int = Query(20, ge=3, le=120),
-    count: int = Query(180, ge=40, le=360),
-):
-    """简易双均线回测，给前端回测页提供可操作结果。"""
-    symbol = _normalize_symbol(symbol)
-    if fast >= slow:
-        fast = max(2, slow // 2)
+STRATEGY_LABELS = {
+    "cross_ma": "双均线",
+    "momentum": "动量",
+    "mean_reversion": "均值回归",
+}
 
+
+def _load_daily_closes(symbol: str, count: int):
+    """拉真实日K, 返回 (closes[float], dates[str])。无数据返回 ([], [])。"""
     df = realtime.get_kline_mootdx(symbol, category=4, offset=count)
     if df.empty:
         df = realtime.get_kline_data(symbol, period='day', count=count)
     if df.empty or 'close' not in [c.lower() for c in df.columns]:
-        return JSONResponse({
-            "symbol": symbol,
-            "strategy": "双均线",
-            "return_pct": 0,
-            "max_drawdown": 0,
-            "win_rate": 0,
-            "trades": [],
-            "equity": [],
-            "message": "暂无可回测的K线数据",
-        })
-
+        return [], []
     df = df.loc[:, ~df.columns.duplicated()].copy()
     lower_cols = {c.lower(): c for c in df.columns}
     close_col = lower_cols.get('close')
-    open_col = lower_cols.get('open', close_col)
     closes = [float(v or 0) for v in df[close_col].tolist()]
-    opens = [float(v or 0) for v in df[open_col].tolist()]
     dates = []
     for idx in df.index:
         if hasattr(idx, 'strftime'):
             dates.append(idx.strftime('%Y-%m-%d'))
         else:
             dates.append(str(idx).split(' ')[0][:10])
+    return closes, dates
 
-    cash = 100000.0
+
+def _ma(values, end, window):
+    if end + 1 < window:
+        return None
+    part = values[end - window + 1:end + 1]
+    return sum(part) / len(part)
+
+
+def _std(values, end, window):
+    if end + 1 < window:
+        return None
+    part = values[end - window + 1:end + 1]
+    m = sum(part) / len(part)
+    var = sum((x - m) ** 2 for x in part) / len(part)
+    return var ** 0.5
+
+
+def _signal_at(closes, i, strategy, p):
+    """第 i 根K线上, 某策略给出的目标动作: 'buy'|'sell'|None(不动作)。
+    全部基于真实历史收盘价计算。"""
+    if strategy == "cross_ma":
+        fast, slow = p["fast"], p["slow"]
+        fn, sn = _ma(closes, i, fast), _ma(closes, i, slow)
+        fp, sp = _ma(closes, i - 1, fast), _ma(closes, i - 1, slow)
+        if None in (fn, sn, fp, sp):
+            return None
+        if fp <= sp and fn > sn:
+            return "buy"      # 金叉
+        if fp >= sp and fn < sn:
+            return "sell"     # 死叉
+        return None
+    if strategy == "momentum":
+        look, thr = p["look"], p["thr"]
+        if i < look:
+            return None
+        past = closes[i - look]
+        if past <= 0:
+            return None
+        chg = (closes[i] - past) / past
+        if chg >= thr:
+            return "buy"
+        if chg <= -thr:
+            return "sell"
+        return None
+    if strategy == "mean_reversion":
+        look, k = p["look"], p["k"]
+        m, sd = _ma(closes, i, look), _std(closes, i, look)
+        if m is None or sd is None or sd == 0:
+            return None
+        price = closes[i]
+        if price < m - k * sd:
+            return "buy"      # 超跌
+        if price > m + k * sd:
+            return "sell"     # 超涨
+        return None
+    return None
+
+
+def _run_strategy_backtest(closes, dates, strategy, params, initial=100000.0):
+    """统一真实回测引擎。满仓进出、下一信号反向平仓。
+    返回真实的收益/回撤/胜率/交易/资金曲线 + 买入持有基准。
+
+    自适应本金: 高价股(如茅台¥1400)10万买不起1手会导致0成交, 故把本金放大到
+    至少能买 1 手(100股)最高价, 收益率口径不变(始终按 initial 归一)。"""
+    max_price = max(closes) if closes else 0
+    lot_cost = max_price * 100
+    capital = max(initial, lot_cost * 1.05)  # 保证任意时点都买得起至少1手
+    cash = capital
     position = 0
     entry_price = 0.0
-    trades = []
-    equity = []
-    peak = cash
+    trades, equity = [], []
+    peak = capital
     max_dd = 0.0
 
-    def ma(values, end, window):
-        if end + 1 < window:
-            return None
-        part = values[end - window + 1:end + 1]
-        return sum(part) / len(part)
-
     for i in range(1, len(closes)):
-        fast_now = ma(closes, i, fast)
-        slow_now = ma(closes, i, slow)
-        fast_prev = ma(closes, i - 1, fast)
-        slow_prev = ma(closes, i - 1, slow)
         price = closes[i]
-        if None not in (fast_now, slow_now, fast_prev, slow_prev):
-            crossed_up = fast_prev <= slow_prev and fast_now > slow_now
-            crossed_down = fast_prev >= slow_prev and fast_now < slow_now
-            if crossed_up and position == 0 and price > 0:
-                position = int(cash / price / 100) * 100
-                if position > 0:
-                    entry_price = price
-                    cash -= position * price
-                    trades.append({"date": dates[i], "side": "buy", "price": round(price, 2), "quantity": position})
-            elif crossed_down and position > 0:
-                cash += position * price
-                pnl_pct = (price - entry_price) / max(entry_price, 1) * 100
-                trades.append({"date": dates[i], "side": "sell", "price": round(price, 2), "quantity": position, "pnl_pct": round(pnl_pct, 2)})
-                position = 0
-                entry_price = 0.0
+        sig = _signal_at(closes, i, strategy, params)
+        if sig == "buy" and position == 0 and price > 0:
+            position = int(cash / price / 100) * 100
+            if position > 0:
+                entry_price = price
+                cash -= position * price
+                trades.append({"date": dates[i], "side": "buy", "price": round(price, 2), "quantity": position})
+        elif sig == "sell" and position > 0:
+            cash += position * price
+            pnl_pct = (price - entry_price) / max(entry_price, 1) * 100
+            trades.append({"date": dates[i], "side": "sell", "price": round(price, 2), "quantity": position, "pnl_pct": round(pnl_pct, 2)})
+            position = 0
+            entry_price = 0.0
         value = cash + position * price
         peak = max(peak, value)
         max_dd = max(max_dd, (peak - value) / max(peak, 1))
-        equity.append({"date": dates[i], "value": round(value, 2), "price": round(price, 2)})
+        # 资金曲线按 initial(10万) 归一, 便于展示; 收益率口径不受自适应本金影响
+        equity.append({"date": dates[i], "value": round(value / capital * initial, 2), "price": round(price, 2)})
 
-    if position > 0 and closes:
-        price = closes[-1]
-        cash += position * price
-        pnl_pct = (price - entry_price) / max(entry_price, 1) * 100
-        trades.append({"date": dates[-1], "side": "sell", "price": round(price, 2), "quantity": position, "pnl_pct": round(pnl_pct, 2)})
+    # 收尾: 未平仓的按最后价结算(仅计入收益, 不记为一笔已实现交易的胜负)
+    final_value = cash + position * (closes[-1] if closes else 0)
 
-    final_value = cash
     sell_trades = [t for t in trades if t.get('side') == 'sell']
     wins = len([t for t in sell_trades if t.get('pnl_pct', 0) > 0])
     win_rate = wins / len(sell_trades) if sell_trades else 0
-    return JSONResponse({
-        "symbol": symbol,
-        "strategy": f"双均线 MA{fast}/MA{slow}",
-        "return_pct": round((final_value - 100000) / 100000 * 100, 2),
+    # 买入持有基准: 首日买满、末日不卖
+    if len(closes) >= 2 and closes[0] > 0:
+        buy_hold = (closes[-1] - closes[0]) / closes[0] * 100
+    else:
+        buy_hold = 0.0
+    return {
+        "return_pct": round((final_value - capital) / capital * 100, 2),
         "max_drawdown": round(max_dd * 100, 2),
         "win_rate": round(win_rate * 100, 1),
-        "trades": trades[-20:],
-        "equity": equity[-120:],
+        "trades": trades,
+        "equity": equity,
+        "buy_hold_return": round(buy_hold, 2),
+        "final_value": round(final_value, 2),
         "last_price": round(closes[-1], 2) if closes else 0,
+    }
+
+
+def _default_params(strategy, fast, slow):
+    if strategy == "momentum":
+        return {"look": max(3, fast * 2), "thr": 0.05}, f"动量 {max(3, fast*2)}日/±5%"
+    if strategy == "mean_reversion":
+        return {"look": slow, "k": 2.0}, f"均值回归 {slow}日±2σ"
+    return {"fast": fast, "slow": slow}, f"双均线 MA{fast}/MA{slow}"
+
+
+@app.get("/api/backtest")
+def run_backtest(
+    symbol: str = Query("sh600000"),
+    strategy: str = Query("cross_ma"),
+    fast: int = Query(5, ge=2, le=60),
+    slow: int = Query(20, ge=3, le=120),
+    count: int = Query(180, ge=40, le=360),
+):
+    """真实历史回测: 支持双均线/动量/均值回归, 附买入持有基准。全部基于真实日K。"""
+    symbol = _normalize_symbol(symbol)
+    if strategy not in STRATEGY_LABELS:
+        strategy = "cross_ma"
+    if fast >= slow:
+        fast = max(2, slow // 2)
+
+    closes, dates = _load_daily_closes(symbol, count)
+    if not closes:
+        return JSONResponse({
+            "symbol": symbol, "strategy": STRATEGY_LABELS[strategy], "strategy_key": strategy,
+            "return_pct": 0, "max_drawdown": 0, "win_rate": 0, "buy_hold_return": 0,
+            "trades": [], "equity": [], "message": "暂无可回测的K线数据",
+        })
+
+    params, label = _default_params(strategy, fast, slow)
+    res = _run_strategy_backtest(closes, dates, strategy, params)
+    return JSONResponse({
+        "symbol": symbol,
+        "strategy": label,
+        "strategy_key": strategy,
+        "return_pct": res["return_pct"],
+        "max_drawdown": res["max_drawdown"],
+        "win_rate": res["win_rate"],
+        "buy_hold_return": res["buy_hold_return"],
+        "trades": res["trades"][-20:],
+        "equity": res["equity"][-120:],
+        "last_price": res["last_price"],
     })
+
 
 
 @app.post("/api/ai_trade")
