@@ -1,0 +1,74 @@
+﻿# 核心依赖
+pandas>=1.5.0
+numpy>=1.21.0
+requests>=2.32.5,<3
+urllib3>=2.2,<3
+charset-normalizer>=3,<4
+python-dateutil>=2.8.0
+pyyaml>=6.0
+python-dotenv>=0.19.0
+
+# 东财防封关键依赖: 以真实 Chrome TLS/JA3 指纹发请求, 绕过 push2/push2ex 对
+# Python requests 握手的屏蔽(否则资金流/北向/涨停池会连接被掐、8s 超时返回空)
+curl_cffi>=0.6.0
+
+# 异步/WebSocket（新版引擎核心）
+websockets>=12.0
+aiohttp>=3.9.0
+
+# 美股/港美股数据
+yfinance>=0.2.0
+ccxt>=4.0.0
+
+# A股数据（新版引擎推荐）
+# mootdx: 通达信TCP实时行情(K线/盘口/逐笔/财务/F10), 不封IP, 优先使用
+mootdx>=0.10
+# akshare: 保留作为回退, 新版已尽可能替换为直连HTTP API
+akshare>=1.8.0
+# stockstats: 技术指标计算(RSI/MACD/BOLL等)
+stockstats>=0.5.0
+
+# A股稳定数据源（可选，装了才启用，自动回退）
+# mootdx: 通达信TCP实时行情, 核心依赖, 不封IP (推荐安装)
+# baostock: 免费无token的历史K线, 作为回退
+# pip install mootdx baostock
+# mootdx>=0.10
+# baostock>=0.8.8
+
+# 可视化（回测/分析）
+matplotlib>=3.5.0
+seaborn>=0.11.0
+
+# Web监控面板
+streamlit>=1.28.0
+plotly>=5.15.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.24.0
+
+# 任务调度
+schedule>=1.1.0
+
+# 情感分析
+snownlp>=0.12.3
+jieba>=0.42.1
+
+# 数据库（状态持久化）
+# SQLite3（Python内置，无需安装）
+
+# 机器学习策略（ML 策略核心依赖，可选）
+scikit-learn>=1.0.0
+
+# AI 大模型决策（strategy.type=ai）
+# LLM 走 OpenAI 兼容协议，仅需 requests（已在核心依赖中），无需额外 SDK
+# API Key 通过环境变量提供，如 DEEPSEEK_API_KEY / DASHSCOPE_API_KEY
+
+# OpenBB 研究数据源（可选，仅当 ai.use_openbb=true 时需要）
+# 体积较大且偏美股/宏观研究，A 股交易不依赖它，故默认不安装：
+# pip install openbb
+
+# Dashboard 自动刷新（可选）
+streamlit-autorefresh>=1.0.0
+
+# 测试（可选）
+pytest>=7.0.0
+pytest-asyncio>=0.21.0

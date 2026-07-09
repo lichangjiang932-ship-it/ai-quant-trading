@@ -1,0 +1,169 @@
+# 量化交易平台配置文件
+
+# 交易配置
+trading:
+  # 初始资金
+  initial_capital: 1000000
+  # 自动交易开关
+  auto_trade: false
+  # 行情更新间隔（秒）
+  update_interval: 3
+  # 新闻更新间隔（秒）
+  news_update_interval: 60
+  # 监控的股票列表
+  symbols:
+    - sh600000
+    - sh600104
+    - sz000001
+    - sz000002
+
+# 券商配置
+broker:
+  # 券商类型：simulated（模拟）, qmt（迅投）
+  type: simulated
+  # QMT配置（仅QMT券商需要）
+  account_id: ""
+  mini_qmt_path: ""
+
+# 策略配置
+strategy:
+  # 策略类型：
+  #   cross_ma       - 均线交叉（默认）
+  #   momentum       - 动量策略（实时版）
+  #   mean_reversion - 均值回归（实时版）
+  #   ml             - 机器学习（scikit-learn 随机森林）
+  #   ai             - 大模型 LLM 决策（需配置下方 ai 段）
+  #   agents         - 多智能体交易系统（需配置下方 agents 段，抄袭 TradingAgents）
+  type: cross_ma
+  
+  # 均线交叉策略参数
+  short_window: 5
+  long_window: 20
+  
+  # 动量策略参数
+  lookback_period: 20
+  entry_threshold: 0.03
+  
+  # 均值回归策略参数
+  exit_threshold: 0.5
+
+# 风险管理
+risk:
+  # 最大仓位比例（占总资产）
+  max_position_size: 0.1
+  # 最大回撤
+  max_drawdown: 0.2
+  # 止损比例
+  stop_loss: 0.05
+  # 止盈比例
+  take_profit: 0.1
+  # 单笔最大风险（占总资产）
+  max_risk_per_trade: 0.01
+  # 最大日亏损比例
+  max_daily_loss: 0.02
+
+# 交易时间配置
+trading_hours:
+  # 盘前
+  pre_market_start: "09:15"
+  # 上午交易时段
+  morning_start: "09:30"
+  morning_end: "11:30"
+  # 下午交易时段
+  afternoon_start: "13:00"
+  afternoon_end: "15:00"
+  # 盘后
+  after_hours_end: "15:30"
+
+# 佣金配置
+commission:
+  # 佣金费率
+  rate: 0.0003
+  # 最低佣金
+  min: 5
+  # 印花税率（卖出时收取）
+  stamp_tax: 0.001
+
+# 告警配置
+alerts:
+  # 涨停告警阈值（%）
+  limit_up_pct: 9.8
+  # 跌停告警阈值（%）
+  limit_down_pct: -9.8
+  # 大幅波动阈值（%）
+  large_change_pct: 5
+  # 成交量激增倍数
+  volume_surge_ratio: 3
+
+# 日志配置
+logging:
+  # 日志目录
+  log_dir: logs
+  # 日志级别：DEBUG, INFO, WARNING, ERROR
+  level: INFO
+
+# 数据源配置
+data_source:
+  # 实时行情数据源：eastmoney（推荐）, sina, tencent
+  realtime: eastmoney
+  # 实时行情源优先级（逐个回退，第一个取到数据即用）
+  # pytdx=通达信TCP协议(需 pip install pytdx，最稳)；未装会自动跳过
+  realtime_order: [pytdx, eastmoney, sina, tencent]
+  # 历史数据数据源：auto（自动选择）, akshare, eastmoney, yfinance
+  history: auto
+  # 历史数据源优先级（baostock 免费无token，需 pip install baostock）
+  history_order: [akshare, baostock, eastmoney, yfinance]
+  # 东财请求最小间隔(秒)，防止高频被封 IP。批量筛选可调大到 1.5~2
+  em_min_interval: 1.0
+
+# AI 大模型决策配置（strategy.type=ai 时生效）
+ai:
+  # 是否启用（仅作标记；真正切换靠 strategy.type=ai）
+  enabled: false
+  # 模型提供方：deepseek 或 qwen（通义千问），均走 OpenAI 兼容协议
+  provider: deepseek
+  # 模型名称
+  model: deepseek-chat
+  # API Key 环境变量名（只存变量名，不要把密钥明文写进配置）
+  # DeepSeek 用 DEEPSEEK_API_KEY，通义千问用 DASHSCOPE_API_KEY
+  api_key_env: DEEPSEEK_API_KEY
+  # OpenAI 兼容端点
+  #   deepseek: https://api.deepseek.com
+  #   qwen:     https://dashscope.aliyuncs.com/compatible-mode/v1
+  base_url: https://api.deepseek.com
+  # 每只股票两次 LLM 决策的最小间隔（秒），用于节流控成本
+  decision_interval: 30
+  # 采样温度（越低越稳健）
+  temperature: 0.2
+  # 生成买卖信号所需的最低置信度
+  confidence_threshold: 0.55
+  # 是否附加 OpenBB 研究背景（需 pip install openbb，仅作参考不下单）
+  use_openbb: false
+
+# 多智能体交易系统配置（strategy.type=agents 时生效，抄袭 TradingAgents 架构）
+# 流程：分析师团队(技术/情感/新闻/基本面) → 多空研究员辩论 → 交易员 → 风控经理 → 反思记忆
+agents:
+  enabled: false
+  # 模型提供方与端点（同 ai 段，走 OpenAI 兼容协议）
+  provider: deepseek
+  api_key_env: DEEPSEEK_API_KEY
+  base_url: https://api.deepseek.com
+  # 两档模型（仿 TradingAgents）：深度模型用于辩论/交易/风控，快速模型用于分析师
+  deep_think_model: deepseek-chat
+  quick_think_model: deepseek-chat
+  temperature: 0.3
+  # 多空研究员辩论轮数（每轮 = 多头+空头各一次调用）
+  max_debate_rounds: 1
+  # 每只股票跑一次完整多智能体流程的最小间隔（秒）。流程较贵，建议 300 秒以上
+  decision_interval: 300
+  # 生成买卖信号所需的最低置信度
+  confidence_threshold: 0.6
+  # 启用哪些分析师：technical / sentiment / news / fundamentals / capital
+  analysts:
+    - technical
+    - sentiment
+    - news
+    - fundamentals
+    - capital
+  # 反思记忆：平仓后记录盈亏与经验，下次该股决策时回灌（从历史中学习）
+  use_memory: true
