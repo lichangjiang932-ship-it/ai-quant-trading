@@ -49,133 +49,346 @@ st.set_page_config(
 
 _DARK_CSS = """
 <style>
-/* 深色主题覆盖 */
-.stApp {
-    background: #0A0A0B;
-    color: #E4E4E7;
-    font-family: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
+/* ═══════════════════════════════════════════════════════
+   Linear-Inspired Engineering Theme for AI Quant Trading
+   ═══════════════════════════════════════════════════════ */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+:root {
+  --bg-deep: #070b11;
+  --bg-base: #0b1018;
+  --bg-raised: #111827;
+  --bg-overlay: #151d2c;
+  --border-subtle: rgba(255,255,255,0.06);
+  --border-default: rgba(255,255,255,0.08);
+  --border-strong: rgba(255,255,255,0.12);
+  --border-active: rgba(59,130,246,0.35);
+  --ink-primary: #e9edf4;
+  --ink-secondary: #8b95a8;
+  --ink-tertiary: #5b6679;
+  --ink-disabled: #3b4456;
+  --accent: #3b82f6;
+  --accent-soft: rgba(59,130,246,0.15);
+  --accent-glow: rgba(59,130,246,0.25);
+  --accent-brass: #d4a24e;
+  --accent-brass-soft: rgba(212,162,78,0.12);
+  --rise: #f43f5e;
+  --fall: #10b981;
+  --rise-soft: rgba(244,63,94,0.12);
+  --fall-soft: rgba(16,185,129,0.12);
+  --mono: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', monospace;
+  --sans: 'Inter', -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'PingFang SC', sans-serif;
 }
-/* 侧边栏 */
+
+/* ── base ── */
+.stApp {
+    background: var(--bg-base);
+    color: var(--ink-primary);
+    font-family: var(--sans);
+    font-feature-settings: "cv02","cv03","cv04","cv09";
+    -webkit-font-smoothing: antialiased;
+}
+
+/* ── dot-grid texture overlay ── */
+.stApp::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    opacity: 0.028;
+    background-image: radial-gradient(circle, #ffffff 1px, transparent 1px);
+    background-size: 20px 20px;
+}
+
+/* ── gradient accents ── */
+.stApp::after {
+    content: "";
+    position: fixed;
+    top: -30%;
+    right: -15%;
+    width: 800px;
+    height: 600px;
+    pointer-events: none;
+    z-index: 0;
+    opacity: 0.06;
+    background: radial-gradient(ellipse, var(--accent) 0%, transparent 70%);
+}
+
+/* ── sidebar ── */
 [data-testid="stSidebar"] {
-    background: #141417 !important;
-    border-right: 1px solid #27272A !important;
+    background: linear-gradient(180deg, var(--bg-deep), var(--bg-raised)) !important;
+    border-right: 1px solid var(--border-default) !important;
 }
 [data-testid="stSidebar"] .stMarkdown h1,
 [data-testid="stSidebar"] .stMarkdown h2,
 [data-testid="stSidebar"] .stMarkdown h3 {
-    color: #E4E4E7 !important;
+    color: var(--ink-primary) !important;
+    font-weight: 600 !important;
+    letter-spacing: -0.01em !important;
 }
 [data-testid="stSidebar"] [data-testid="stRadio"] label {
-    color: #A1A1AA !important;
+    color: var(--ink-tertiary) !important;
+    transition: color 0.15s ease !important;
 }
 [data-testid="stSidebar"] [data-testid="stRadio"] label:hover {
-    color: #E4E4E7 !important;
+    color: var(--ink-primary) !important;
 }
-/* 主标题 */
+
+/* ── headings ── */
 h1, h2, h3 {
-    color: #E4E4E7 !important;
+    color: var(--ink-primary) !important;
     font-weight: 600 !important;
+    letter-spacing: -0.015em !important;
 }
-/* 卡片容器 */
+
+/* ── KPI cards ── */
 .kpi-card {
-    background: #141417;
-    border: 1px solid #27272A;
-    border-radius: 12px;
+    background: linear-gradient(135deg, var(--bg-raised), var(--bg-overlay));
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
     padding: 16px 20px;
     margin-bottom: 12px;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+    position: relative;
+    overflow: hidden;
+}
+.kpi-card:hover {
+    border-color: var(--border-strong);
+}
+.kpi-card::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, var(--accent), transparent 80%);
+    opacity: 0.3;
 }
 .kpi-label {
-    font-size: 13px;
-    color: #71717A;
-    margin-bottom: 4px;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--ink-tertiary);
+    margin-bottom: 6px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
 }
 .kpi-value {
-    font-size: 24px;
-    font-weight: 700;
-    font-family: 'JetBrains Mono', monospace;
-    color: #E4E4E7;
+    font-size: 26px;
+    font-weight: 650;
+    font-family: var(--mono);
+    color: var(--ink-primary);
+    letter-spacing: -0.02em;
 }
 .kpi-delta-up {
-    color: #EF4444 !important;
+    color: var(--rise) !important;
 }
 .kpi-delta-down {
-    color: #22C55E !important;
+    color: var(--fall) !important;
 }
-/* 按钮 */
+
+/* ── buttons ── */
 .stButton > button {
-    background: #1C1C20 !important;
-    color: #E4E4E7 !important;
-    border: 1px solid #27272A !important;
+    background: var(--bg-raised) !important;
+    color: var(--ink-secondary) !important;
+    border: 1px solid var(--border-default) !important;
     border-radius: 8px !important;
+    font-family: var(--sans) !important;
+    font-weight: 500 !important;
+    font-size: 13px !important;
+    letter-spacing: -0.005em !important;
+    transition: all 0.15s ease !important;
+}
+.stButton > button:hover {
+    border-color: var(--border-strong) !important;
+    color: var(--ink-primary) !important;
+    background: var(--bg-overlay) !important;
 }
 .stButton > button[kind="primary"] {
-    background: #0EA5E9 !important;
-    color: #0A0A0B !important;
+    background: linear-gradient(135deg, var(--accent), #2563eb) !important;
+    color: #fff !important;
     border: none !important;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.2), 0 0 0 1px rgba(59,130,246,0.3) !important;
 }
-/* 输入框 */
+.stButton > button[kind="primary"]:hover {
+    background: linear-gradient(135deg, #4b90f5, #306df0) !important;
+    box-shadow: 0 2px 8px rgba(59,130,246,0.35), 0 0 0 1px rgba(59,130,246,0.45) !important;
+}
+.stButton > button[kind="secondary"] {
+    background: var(--bg-overlay) !important;
+    border-color: var(--border-strong) !important;
+}
+
+/* ── inputs ── */
 .stTextInput input,
 .stNumberInput input,
 .stSelectbox select,
 .stSlider {
-    background: #1C1C20 !important;
-    color: #E4E4E7 !important;
-    border: 1px solid #27272A !important;
+    background: var(--bg-deep) !important;
+    color: var(--ink-primary) !important;
+    border: 1px solid var(--border-default) !important;
     border-radius: 8px !important;
+    font-family: var(--mono) !important;
+    font-size: 13px !important;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease !important;
 }
-/* 表格 */
+.stTextInput input:focus,
+.stNumberInput input:focus {
+    border-color: var(--border-active) !important;
+    box-shadow: 0 0 0 3px var(--accent-soft) !important;
+}
+
+/* ── tables ── */
 [data-testid="stDataFrame"] table {
-    background: #141417 !important;
-    color: #E4E4E7 !important;
+    background: transparent !important;
+    color: var(--ink-primary) !important;
+    border-collapse: separate !important;
+    border-spacing: 0 !important;
 }
 [data-testid="stDataFrame"] th {
-    background: #1C1C20 !important;
-    color: #A1A1AA !important;
+    background: var(--bg-raised) !important;
+    color: var(--ink-tertiary) !important;
+    font-size: 10px !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.06em !important;
+    text-transform: uppercase !important;
+    border-bottom: 1px solid var(--border-default) !important;
+    padding: 10px 12px !important;
 }
 [data-testid="stDataFrame"] td {
-    border-bottom: 1px solid #27272A !important;
+    border-bottom: 1px solid var(--border-subtle) !important;
+    padding: 9px 12px !important;
+    font-size: 13px !important;
+    font-variant-numeric: tabular-nums !important;
 }
-/* 信息提示 */
+[data-testid="stDataFrame"] tbody tr:hover td {
+    background: rgba(255,255,255,0.02) !important;
+}
+
+/* ── alerts ── */
 .stInfo, .stSuccess, .stWarning, .stError {
-    background: #141417 !important;
-    border: 1px solid #27272A !important;
-    color: #E4E4E7 !important;
     border-radius: 8px !important;
+    font-size: 13px !important;
+    font-family: var(--sans) !important;
 }
-/* 折叠面板 */
+.stInfo {
+    background: rgba(59,130,246,0.08) !important;
+    border: 1px solid rgba(59,130,246,0.2) !important;
+    color: #93bbfd !important;
+}
+.stSuccess {
+    background: var(--fall-soft) !important;
+    border: 1px solid rgba(16,185,129,0.2) !important;
+    color: #6ee7b7 !important;
+}
+.stWarning {
+    background: rgba(245,158,11,0.08) !important;
+    border: 1px solid rgba(245,158,11,0.2) !important;
+    color: #fcd34d !important;
+}
+.stError {
+    background: var(--rise-soft) !important;
+    border: 1px solid rgba(244,63,94,0.2) !important;
+    color: #fda4af !important;
+}
+
+/* ── expanders ── */
 .streamlit-expanderHeader {
-    background: #141417 !important;
-    border: 1px solid #27272A !important;
+    background: var(--bg-raised) !important;
+    border: 1px solid var(--border-subtle) !important;
     border-radius: 8px !important;
-    color: #E4E4E7 !important;
+    color: var(--ink-secondary) !important;
+    font-size: 13px !important;
+    transition: border-color 0.15s ease !important;
 }
-/* 标签页 */
+.streamlit-expanderHeader:hover {
+    border-color: var(--border-default) !important;
+    color: var(--ink-primary) !important;
+}
+
+/* ── tabs ── */
 .stTabs [data-baseweb="tab-list"] {
-    background: #141417 !important;
+    background: var(--bg-raised) !important;
     border-radius: 8px !important;
+    border: 1px solid var(--border-subtle) !important;
+    padding: 4px !important;
+    gap: 2px !important;
 }
 .stTabs [data-baseweb="tab"] {
-    color: #A1A1AA !important;
+    color: var(--ink-tertiary) !important;
+    border-radius: 6px !important;
+    font-weight: 500 !important;
+    font-size: 13px !important;
+    padding: 6px 14px !important;
+    transition: all 0.15s ease !important;
+}
+.stTabs [data-baseweb="tab"]:hover {
+    color: var(--ink-secondary) !important;
+    background: rgba(255,255,255,0.03) !important;
 }
 .stTabs [data-baseweb="tab--selected"] {
-    color: #0EA5E9 !important;
-    border-bottom-color: #0EA5E9 !important;
+    color: var(--ink-primary) !important;
+    background: var(--bg-overlay) !important;
+    border-bottom: none !important;
+    box-shadow: 0 0 0 1px var(--border-default) !important;
 }
-/* metric */
+
+/* ── metrics ── */
 [data-testid="stMetric"] {
-    background: #141417 !important;
-    border: 1px solid #27272A !important;
-    border-radius: 12px !important;
-    padding: 12px 16px !important;
+    background: linear-gradient(135deg, var(--bg-raised), var(--bg-overlay)) !important;
+    border: 1px solid var(--border-subtle) !important;
+    border-radius: 10px !important;
+    padding: 14px 18px !important;
+    transition: border-color 0.2s ease !important;
+}
+[data-testid="stMetric"]:hover {
+    border-color: var(--border-strong) !important;
 }
 [data-testid="stMetric"] label {
-    color: #71717A !important;
+    color: var(--ink-tertiary) !important;
+    font-size: 11px !important;
+    font-weight: 500 !important;
+    letter-spacing: 0.03em !important;
 }
 [data-testid="stMetricValue"] {
-    color: #E4E4E7 !important;
-    font-family: 'JetBrains Mono', monospace !important;
-    font-weight: 700 !important;
+    color: var(--ink-primary) !important;
+    font-family: var(--mono) !important;
+    font-weight: 650 !important;
+    font-size: 22px !important;
+    letter-spacing: -0.02em !important;
 }
+
+/* ── checkbox / radio ── */
+[data-testid="stCheckbox"] label {
+    color: var(--ink-secondary) !important;
+    font-size: 13px !important;
+}
+
+/* ── selectbox dropdown ── */
+.stSelectbox [data-baseweb="popover"] {
+    background: var(--bg-raised) !important;
+    border: 1px solid var(--border-strong) !important;
+    border-radius: 8px !important;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.5) !important;
+}
+
+/* ── progress bars ── */
+.stProgress > div > div {
+    background: var(--bg-overlay) !important;
+    border-radius: 999px !important;
+}
+.stProgress > div > div > div {
+    background: linear-gradient(90deg, var(--accent), #60a5fa) !important;
+    border-radius: 999px !important;
+}
+
+/* ── scrollbar ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 999px; }
+::-webkit-scrollbar-thumb:hover { background: var(--ink-disabled); }
 </style>
 """
 st.markdown(_DARK_CSS, unsafe_allow_html=True)
@@ -253,7 +466,7 @@ def action_label(action: str) -> str:
 
 
 def action_badge(action: str) -> str:
-    color = {"buy": "#dc2626", "sell": "#059669", "hold": "#475569"}.get(action, "#475569")
+    color = {"buy": "#f43f5e", "sell": "#10b981", "hold": "#546078"}.get(action, "#546078")
     return f"<span style='color:{color};font-weight:700'>{action_label(action)}</span>"
 
 
@@ -585,7 +798,7 @@ def render_ai_decision_detail(symbol: str, decision: dict):
         })
 
 
-def render_kpi_card(label, value, delta=None, delta_label=None, color="#E4E4E7"):
+def render_kpi_card(label, value, delta=None, delta_label=None, color="#e9edf4"):
     delta_html = ""
     if delta is not None:
         cls = "kpi-delta-up" if delta >= 0 else "kpi-delta-down"
@@ -604,13 +817,13 @@ def render_quote_card(symbol, q):
     name = q.get('name', symbol)
     price = float(q.get('price') or 0)
     change_pct = float(q.get('change_pct') or 0)
-    color = "#EF4444" if change_pct >= 0 else "#22C55E"
+    color = "#f43f5e" if change_pct >= 0 else "#10b981"
     arrow = "▲" if change_pct >= 0 else "▼"
     st.markdown(
         f"<div class='kpi-card' style='padding:12px 14px'>"
         f"<div style='display:flex;justify-content:space-between;align-items:center'>"
-        f"<span style='font-weight:600;color:#E4E4E7'>{name}</span>"
-        f"<span style='font-size:11px;color:#71717A'>{symbol}</span>"
+        f"<span style='font-weight:600;color:#e9edf4'>{name}</span>"
+        f"<span style='font-size:11px;color:#5b6679'>{symbol}</span>"
         f"</div>"
         f"<div style='display:flex;justify-content:space-between;align-items:baseline;margin-top:8px'>"
         f"<span style='font-size:20px;font-weight:700;font-family:JetBrains Mono,monospace;color:{color}'>{price:.2f}</span>"
@@ -648,7 +861,7 @@ def render_ai_cockpit():
             format_money(total_pnl),
             delta=pnl_pct * 100,
             delta_label="%",
-            color="#EF4444" if total_pnl >= 0 else "#22C55E",
+            color="#f43f5e" if total_pnl >= 0 else "#10b981",
         )
     with kpi_cols[2]:
         win_rate = 0.0
@@ -660,7 +873,7 @@ def render_ai_cockpit():
         render_kpi_card("胜率", f"{win_rate:.1%}")
     with kpi_cols[3]:
         active_strategies = len(cfg.get('trading.symbols', []))
-        render_kpi_card("活跃策略", str(active_strategies), color="#0EA5E9")
+        render_kpi_card("活跃策略", str(active_strategies), color="#3b82f6")
 
     # 状态栏
     status_cols = st.columns(5)
@@ -763,13 +976,13 @@ def render_ai_cockpit():
                     yaxis_title='价格',
                     hovermode='x unified',
                     height=500,
-                    paper_bgcolor='#0A0A0B',
-                    plot_bgcolor='#141417',
-                    font=dict(color='#E4E4E7'),
+                    paper_bgcolor='#0b1018',
+                    plot_bgcolor='rgba(255,255,255,0.015)',
+                    font=dict(color='#8b95a8'),
                     legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
                 )
-                fig.update_xaxes(rangeslider_visible=False, gridcolor='#27272A')
-                fig.update_yaxes(gridcolor='#27272A')
+                fig.update_xaxes(rangeslider_visible=False, gridcolor='rgba(255,255,255,0.06)')
+                fig.update_yaxes(gridcolor='rgba(255,255,255,0.06)')
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("暂无K线数据，请尝试其他股票代码")
@@ -942,9 +1155,9 @@ elif page == "实时行情":
                         '昨收': '¥{:.2f}',
                         '今开': '¥{:.2f}',
                     }).map(
-                        lambda x: 'color: #EF4444; font-weight: 600'
+                        lambda x: 'color: #f43f5e; font-weight: 600'
                         if isinstance(x, (int, float)) and x > 0
-                        else ('color: #22C55E; font-weight: 600'
+                        else ('color: #10b981; font-weight: 600'
                               if isinstance(x, (int, float)) and x < 0 else ''),
                         subset=['涨跌幅(%)', '涨跌额']
                     ),
@@ -1002,13 +1215,13 @@ elif page == "实时行情":
                 yaxis_title='价格',
                 hovermode='x unified',
                 height=600,
-                paper_bgcolor='#0A0A0B',
-                plot_bgcolor='#141417',
-                font=dict(color='#E4E4E7'),
+                paper_bgcolor='#0b1018',
+                plot_bgcolor='rgba(255,255,255,0.015)',
+                font=dict(color='#8b95a8'),
                 legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
             )
-            fig.update_xaxes(rangeslider_visible=False, gridcolor='#27272A')
-            fig.update_yaxes(gridcolor='#27272A')
+            fig.update_xaxes(rangeslider_visible=False, gridcolor='rgba(255,255,255,0.06)')
+            fig.update_yaxes(gridcolor='rgba(255,255,255,0.06)')
             chart_placeholder.plotly_chart(fig, use_container_width=True)
         else:
             st.info("暂无K线数据，请尝试其他股票代码或检查网络连接")
