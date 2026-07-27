@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from concurrent.futures import ThreadPoolExecutor
 
+from .a_share_rules import instrument_type
+
 
 class ExecSpeed(Enum):
     INSTANT = "instant"
@@ -37,7 +39,7 @@ class FastBroker:
         self,
         initial_capital: float = 1_000_000,
         commission_rate: float = 0.0003,
-        stamp_tax_rate: float = 0.001,
+        stamp_tax_rate: float = 0.0005,
         min_commission: float = 5.0,
         exec_speed: ExecSpeed = ExecSpeed.INSTANT
     ):
@@ -123,7 +125,7 @@ class FastBroker:
 
         total_revenue = sell_qty * exec_price
         commission = max(total_revenue * self.commission_rate, self.min_commission)
-        stamp_tax = total_revenue * self.stamp_tax_rate
+        stamp_tax = 0 if instrument_type(symbol) == 'etf' else total_revenue * self.stamp_tax_rate
         entry_cost = sell_qty * pos['avg_cost']
         pnl = total_revenue - entry_cost - commission - stamp_tax
 
@@ -174,7 +176,7 @@ class FastBroker:
     def _apply_sell(self, order: ExecOrder, pnl: float):
         total_revenue = order.filled_quantity * order.filled_price
         commission = max(total_revenue * self.commission_rate, self.min_commission)
-        stamp_tax = total_revenue * self.stamp_tax_rate
+        stamp_tax = 0 if instrument_type(order.symbol) == 'etf' else total_revenue * self.stamp_tax_rate
         self.cash += (total_revenue - commission - stamp_tax)
 
         if order.symbol in self.positions:

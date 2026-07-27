@@ -1,8 +1,9 @@
-import pandas as pd
+﻿import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 from ..strategies.base_strategy import BaseStrategy, Signal
+from ..execution.a_share_rules import backtest_trade_rejection, instrument_type
 from .portfolio import Portfolio
 
 
@@ -13,7 +14,7 @@ class Backtester:
         commission: float = 0.001,
         slippage: float = 0.001,
         risk_free_rate: float = 0.02,
-        stamp_tax: float = 0.001,
+        stamp_tax: float = 0.0005,
         min_commission: float = 5.0
     ):
         self.initial_capital = initial_capital
@@ -25,6 +26,7 @@ class Backtester:
         self.portfolio = Portfolio(initial_capital)
         self.trades: List[Dict] = []
         self.equity_curve: List[Dict] = []
+        self.rejected_orders: List[Dict] = []
         self._strategy: Optional[BaseStrategy] = None
 
     def run_backtest(
@@ -38,42 +40,87 @@ class Backtester:
         self.portfolio = Portfolio(self.initial_capital)
         self.trades = []
         self.equity_curve = []
+        self.rejected_orders = []
 
         if data is None or data.empty:
             return {}
 
-        data_with_signals = strategy.generate_signals(data)
+        data_with_signals = strategy.generate_signals(data).copy()
         if 'signal' not in data_with_signals.columns:
             return {}
 
-        for date, row in data_with_signals.iterrows():
-            raw = row.get('signal', np.nan)
+        data_with_signals['execution_signal'] = data_with_signals['signal'].shift(1)
+
+        for row_number, (date, row) in enumerate(data_with_signals.iterrows()):
+            raw = row.get('execution_signal', np.nan)
+            mark_price = row.get('Close', np.nan)
             if pd.isna(raw):
-                current_price = row.get('Close', np.nan)
-                if not pd.isna(current_price):
-                    self._update_equity_curve(date, current_price)
+                if not pd.isna(mark_price):
+                    self._update_equity_curve(date, mark_price)
                 continue
 
             try:
                 signal = Signal(int(raw))
             except (ValueError, TypeError):
+                if not pd.isna(mark_price):
+                    self._update_equity_curve(date, mark_price)
                 continue
 
-            current_price = row['Close']
+            current_price = row.get('Open', row.get('Close', np.nan))
             if pd.isna(current_price) or current_price <= 0:
+                if not pd.isna(mark_price):
+                    self._update_equity_curve(date, mark_price)
                 continue
 
+            previous_close = (
+                float(data_with_signals['Close'].iloc[row_number - 1])
+                if row_number > 0
+                else float(current_price)
+            )
             if strategy.should_exit_position(symbol, signal, current_price):
-                self._execute_exit(symbol, current_price, date)
+                rejection = backtest_trade_rejection(
+                    symbol,
+                    "sell",
+                    previous_close,
+                    float(current_price),
+                    float(row.get('High', current_price)),
+                    float(row.get('Low', current_price)),
+                    row.get('Volume'),
+                )
+                if rejection:
+                    self._record_rejection(date, symbol, "sell", current_price, rejection)
+                else:
+                    self._execute_exit(symbol, current_price, date)
             elif strategy.should_enter_position(
                 symbol, signal, current_price, self.portfolio.total_value
             ):
-                position_size = strategy.calculate_position_size(
-                    signal, current_price, self.portfolio.total_value
+                rejection = backtest_trade_rejection(
+                    symbol,
+                    "buy",
+                    previous_close,
+                    float(current_price),
+                    float(row.get('High', current_price)),
+                    float(row.get('Low', current_price)),
+                    row.get('Volume'),
                 )
-                self._execute_entry(symbol, position_size, current_price, date)
+                if rejection:
+                    self._record_rejection(date, symbol, "buy", current_price, rejection)
+                else:
+                    position_fraction = row.get('position_fraction', np.nan)
+                    if not pd.isna(position_fraction) and 0 < float(position_fraction) <= 1:
+                        position_size = int(
+                            self.portfolio.total_value
+                            * float(position_fraction)
+                            / current_price
+                            / 100
+                        ) * 100
+                    else:
+                        position_size = strategy.calculate_position_size(
+                            signal, current_price, self.portfolio.total_value
+                        )
+                    self._execute_entry(symbol, position_size, current_price, date)
 
-            self._update_equity_curve(date, current_price)
+            self._update_equity_curve(date, mark_price if not pd.isna(mark_price) else current_price)
 
         return self._calculate_results()
 
@@ -161,9 +208,10 @@ class Backtester:
             commission_cost = max(total_cost * self.commission, self.min_commission)
 
         self.portfolio.cash -= (total_cost + commission_cost)
-        self.portfolio.update_position(symbol, shares, executed_price, date)
+        effective_entry_price = (total_cost + commission_cost) / shares
+        self.portfolio.update_position(symbol, shares, effective_entry_price, date)
         if self._strategy is not None:
-            self._strategy.update_position(symbol, shares, executed_price, date)
+            self._strategy.update_position(symbol, shares, effective_entry_price, date)
 
         self.trades.append({
             'date': date,
@@ -177,6 +225,15 @@ class Backtester:
             'pnl': 0
         })
 
+    def _record_rejection(self, date, symbol: str, side: str, price: float, reason: str):
+        self.rejected_orders.append({
+            'date': date,
+            'symbol': symbol,
+            'side': side,
+            'price': float(price),
+            'reason': reason,
+        })
+
     def _execute_exit(self, symbol: str, price: float, date):
         if symbol not in self.portfolio.positions:
             return
@@ -188,7 +245,7 @@ class Backtester:
         executed_price = price * (1 - self.slippage)
         total_revenue = shares * executed_price
         commission_cost = max(total_revenue * self.commission, self.min_commission)
-        stamp_tax_cost = total_revenue * self.stamp_tax
+        stamp_tax_cost = 0 if instrument_type(symbol) == 'etf' else total_revenue * self.stamp_tax
         entry_cost = shares * position['entry_price']
         pnl = total_revenue - entry_cost - commission_cost - stamp_tax_cost
 
@@ -282,6 +339,8 @@ class Backtester:
             'profit_factor': float(profit_factor) if profit_factor != float('inf') else 999.0,
             'total_commission': float(total_commission),
             'total_stamp_tax': float(total_stamp_tax),
+            'rejected_order_count': len(self.rejected_orders),
+            'rejected_orders': self.rejected_orders,
             'daily_returns_std': float(daily_returns.std()) if not daily_returns.empty else 0,
             'trades': self.trades,
             'equity_curve': equity_df,

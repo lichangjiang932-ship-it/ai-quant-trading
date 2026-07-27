@@ -64,6 +64,10 @@ class Order:
         self.status = OrderStatus.PENDING
         self.filled_quantity = 0
         self.filled_price = None
+        self.commission = 0.0
+        self.stamp_tax = 0.0
+        self.realized_pnl = 0.0
+        self.reject_reason = ""
         self.created_at = datetime.now()
         self.updated_at = datetime.now()
     
@@ -80,6 +84,10 @@ class Order:
             'status': self.status.value,
             'filled_quantity': self.filled_quantity,
             'filled_price': self.filled_price,
+            'commission': self.commission,
+            'stamp_tax': self.stamp_tax,
+            'realized_pnl': self.realized_pnl,
+            'reject_reason': self.reject_reason,
             'created_at': self.created_at.isoformat(),
             'updated_at': self.updated_at.isoformat()
         }
@@ -94,7 +102,9 @@ class Position:
         quantity: int,
         avg_cost: float,
         market_value: float = 0,
-        unrealized_pnl: float = 0
+        unrealized_pnl: float = 0,
+        available_quantity: Optional[int] = None,
+        today_bought: int = 0,
     ):
         """
         初始化持仓
@@ -111,6 +121,8 @@ class Position:
         self.avg_cost = avg_cost
         self.market_value = market_value
         self.unrealized_pnl = unrealized_pnl
+        self.available_quantity = quantity if available_quantity is None else available_quantity
+        self.today_bought = today_bought
     
     def to_dict(self) -> Dict:
         """转换为字典"""
@@ -119,7 +131,9 @@ class Position:
             'quantity': self.quantity,
             'avg_cost': self.avg_cost,
             'market_value': self.market_value,
-            'unrealized_pnl': self.unrealized_pnl
+            'unrealized_pnl': self.unrealized_pnl,
+            'available_quantity': self.available_quantity,
+            'today_bought': self.today_bought,
         }
 
 

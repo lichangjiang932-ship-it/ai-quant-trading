@@ -148,8 +148,19 @@ class NewsAnalyzer:
     
     def get_symbol_news(self, symbol: str, count: int = 10) -> List[Dict]:
         """获取个股新闻"""
-        news_list = self.news_fetcher.fetch_stock_news(symbol, count)
-        return [{'news': n.to_dict(), 'sentiment': self.sentiment_analyzer.analyze_news(n.to_dict())} for n in news_list]
+        return self.get_symbol_news_with_meta(symbol, count)['items']
+
+    def get_symbol_news_with_meta(self, symbol: str, count: int = 10) -> Dict:
+        """获取个股公告/研报及数据源覆盖信息。"""
+        result = self.news_fetcher.fetch_stock_news_with_meta(symbol, count)
+        items = []
+        for news in result.get('items', []):
+            payload = news.to_dict()
+            items.append({
+                'news': payload,
+                'sentiment': self.sentiment_analyzer.analyze_news(payload),
+            })
+        return {'items': items, 'status': result.get('status', {})}
     
     def get_market_news(self, count: int = 20) -> List[Dict]:
         """获取市场新闻"""

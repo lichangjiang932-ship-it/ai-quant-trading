@@ -14,6 +14,26 @@ import pandas as pd
 from ..data.em_client import em_get  # 东财请求统一走节流器,防封 IP
 
 
+def _clean_stock_code(symbol: str) -> str:
+    """把 sh600000 / 600000.SH 等格式统一为 6 位代码。"""
+    value = str(symbol or "").strip().lower()
+    value = re.sub(r"^(sh|sz|bj)", "", value)
+    value = re.sub(r"\.(sh|sz|bj)$", "", value)
+    match = re.search(r"(\d{6})", value)
+    return match.group(1) if match else value
+
+
+def _normalized_symbol(code: str) -> str:
+    code = _clean_stock_code(code)
+    if not (code.isdigit() and len(code) == 6):
+        return ""
+    if code.startswith(("4", "8")):
+        return f"bj{code}"
+    if code.startswith(("5", "6", "9")):
+        return f"sh{code}"
+    return f"sz{code}"
+
+
 class NewsItem:
     """新闻条目类"""
     
@@ -62,12 +82,21 @@ class NewsFetcher:
         self.running = False
         self._thread = None
         self._stop_event = Event()
+        self.source_health: Dict[str, Dict] = {}
         
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
             'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
             'Referer': 'https://www.eastmoney.com/'
+        }
+
+    def _record_source(self, source: str, ok: bool, count: int = 0, error: str = ""):
+        self.source_health[source] = {
+            "available": bool(ok),
+            "count": max(int(count or 0), 0),
+            "error": str(error or "")[:160],
+            "checked_at": datetime.now().isoformat(),
         }
     
     def register_callback(self, callback):
@@ -229,7 +258,8 @@ class NewsFetcher:
                 'ann_type': 'A', 'client_source': 'web', 'f_node': '0'
             }
             if symbol:
-                params['stock_list'] = symbol
+                # 东财 stock_list 只接受裸 6 位代码，传 sh/sz 前缀会正常返回空列表。
+                params['stock_list'] = _clean_stock_code(symbol)
 
             response = em_get(url, params=params, headers=self.headers, timeout=10)
             data = response.json()
@@ -250,12 +280,14 @@ class NewsFetcher:
                         source='东方财富公告',
                         url=f"https://data.eastmoney.com/notices/detail/{stock_code}/{item.get('art_code', '')}.html",
                         publish_time=self._parse_time(item.get('notice_date', '') or item.get('display_time', '')),
-                        symbols=[f'sh{stock_code}'] if stock_code.startswith('6') else ([f'sz{stock_code}'] if stock_code else []),
+                        symbols=[_normalized_symbol(stock_code)] if _normalized_symbol(stock_code) else [],
                         category='公司公告',
                         importance=7
                     )
                     news_list.append(news)
+            self._record_source('eastmoney_announcements', True, len(news_list))
         except Exception as e:
+            self._record_source('eastmoney_announcements', False, 0, str(e))
             print(f"获取公告失败: {e}")
         return news_list
     
@@ -272,6 +304,9 @@ class NewsFetcher:
                 'qType': '0', 'orgCode': '', 'rcode': '', 'p': '1',
                 'pageNum': '1', 'pageNumber': '1'
             }
+            if keyword:
+                # report/list 的 code 参数支持按个股定向查询，避免先拉市场研报再错误过滤。
+                params['code'] = _clean_stock_code(keyword)
 
             response = em_get(url, params=params, headers=self.headers, timeout=10)
             data = response.json()
@@ -291,12 +326,14 @@ class NewsFetcher:
                         source='东方财富研报',
                         url=f"https://data.eastmoney.com/report/info/{item.get('infoCode', '')}.html",
                         publish_time=self._parse_time(item.get('publishDate', '')),
-                        symbols=[item.get('stockCode', '')] if item.get('stockCode') else [],
+                        symbols=[_normalized_symbol(item.get('stockCode', ''))] if _normalized_symbol(item.get('stockCode', '')) else [],
                         category='研究报告',
                         importance=6
                     )
                     news_list.append(news)
+            self._record_source('eastmoney_reports', True, len(news_list))
         except Exception as e:
+            self._record_source('eastmoney_reports', False, 0, str(e))
             print(f"获取研报失败: {e}")
         return news_list
     
@@ -510,22 +547,70 @@ class NewsFetcher:
         return unique
     
     def fetch_stock_news(self, symbol: str, count: int = 10) -> List[NewsItem]:
-        """获取个股新闻"""
+        """按个股定向获取公告和研报，并在东财公告不足时回退巨潮。"""
+        return self.fetch_stock_news_with_meta(symbol, count)['items']
+
+    def fetch_stock_news_with_meta(self, symbol: str, count: int = 10) -> Dict:
+        """获取个股研究材料，同时返回实际使用的数据源和覆盖状态。"""
         all_news = []
+        code = _clean_stock_code(symbol)
+        normalized = _normalized_symbol(code)
         
         # 个股公告
         all_news.extend(self.fetch_stock_announcements(symbol, count))
         
-        # 个股研报
-        try:
-            reports = self.fetch_research_reports(count=count)
-            for r in reports:
-                if symbol in r.symbols:
-                    all_news.append(r)
-        except Exception:
-            pass
-        
-        return all_news[:count]
+        # 个股研报必须使用 code 参数定向查询；旧逻辑把裸代码和 sh/sz 代码比较，永远匹配不到。
+        all_news.extend(self.fetch_research_reports(keyword=code, count=count))
+
+        # 巨潮是法定信息披露源；当东财公告为空时按需回退，而不是无差别增加爬取量。
+        cninfo_count = 0
+        if not any(item.category == '公司公告' for item in all_news):
+            try:
+                from ..data.sources.fundamental import cninfo_announcements
+
+                for row in cninfo_announcements(code, page_size=count):
+                    all_news.append(NewsItem(
+                        title=f"[公告] {row.get('title', '')}",
+                        content=f"公告类型: {row.get('type', '')}",
+                        source='巨潮资讯',
+                        url=row.get('url', ''),
+                        publish_time=self._parse_time(row.get('date', '')),
+                        symbols=[normalized] if normalized else [],
+                        category='公司公告',
+                        importance=7,
+                    ))
+                    cninfo_count += 1
+                self._record_source('cninfo_announcements', True, cninfo_count)
+            except Exception as exc:
+                self._record_source('cninfo_announcements', False, 0, str(exc))
+
+        seen = set()
+        unique = []
+        for item in all_news:
+            key = (item.title.strip(), item.url.strip())
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(item)
+        unique.sort(key=lambda item: item.publish_time or datetime.min, reverse=True)
+
+        source_names = sorted({item.source for item in unique if item.source})
+        checked = [
+            dict({'source': key}, **value)
+            for key, value in self.source_health.items()
+            if key in {'eastmoney_announcements', 'eastmoney_reports', 'cninfo_announcements'}
+        ]
+        covered = any(item.get('available') for item in checked)
+        return {
+            'items': unique[:count],
+            'status': {
+                'available': covered,
+                'records': len(unique),
+                'sources': source_names,
+                'checks': checked,
+                'missing_reason': '' if covered else '公告与研报数据源均不可用',
+            },
+        }
     
     # ==================== 监控方法 ====================
     

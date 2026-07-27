@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import time
 import signal
 import sys
@@ -102,7 +102,7 @@ class TradingEngine:
         """
         initial_capital = self.config.get('trading.initial_capital', 1_000_000)
         commission_rate = self.config.get('commission.rate', 0.0003)
-        stamp_tax_rate = self.config.get('commission.stamp_tax', 0.001)
+        stamp_tax_rate = self.config.get('commission.stamp_tax', 0.0005)
         min_commission = self.config.get('commission.min', 5.0)
 
         def _make_fast():
@@ -404,10 +404,22 @@ class TradingEngine:
         if signal.signal_type == SignalType.BUY:
             quantity = signal.quantity or self._calc_buy_qty(symbol, price)
             account = self.broker.get_account_info()
+            positions = self.broker.get_positions()
+            current_symbol_value = 0.0
+            for position in positions:
+                position_symbol = position.get('symbol') if isinstance(position, dict) else getattr(position, 'symbol', '')
+                if position_symbol == symbol:
+                    current_symbol_value = float(
+                        position.get('market_value', 0) if isinstance(position, dict)
+                        else getattr(position, 'market_value', 0)
+                    )
+                    break
+            self.risk_manager.check_drawdown(float(account.get('total_asset', 0) or 0))
             order_req = OrderRequest(
                 symbol=symbol, side=OrderSide.BUY, quantity=quantity, price=price,
                 portfolio_value=account.get('total_asset', 0),
                 current_position_value=account.get('market_value', 0),
+                current_symbol_value=current_symbol_value,
                 reason=reason,
             )
             risk = self.risk_manager.check_order(order_req)

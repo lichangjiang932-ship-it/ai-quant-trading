@@ -8,7 +8,7 @@ import time
 import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Callable
-from threading import Thread, Event
+from threading import Thread, Event, RLock
 import pandas as pd
 
 
@@ -22,6 +22,11 @@ class RealtimeData:
         self._thread = None
         self._stop_event = Event()
         self._pytdx_client = None  # 惰性初始化(仅当用到 pytdx 源时)
+        self._mootdx_source = None
+        self._mootdx_lock = RLock()
+        self._health_lock = RLock()
+        self._source_health: Dict[str, Dict] = {}
+        self.http_timeout = 3.0
         # 境内行情源(新浪/腾讯/东财)直连,忽略系统代理/VPN,避免代理不通导致请求失败
         self._session = requests.Session()
         self._session.trust_env = False
@@ -36,45 +41,50 @@ class RealtimeData:
         Returns:
             Dict: 实时行情数据
         """
-        results = {}
-        
-        for symbol in symbols:
-            try:
-                url = f"http://hq.sinajs.cn/list={symbol}"
-                headers = {
+        requested = list(dict.fromkeys(symbols))
+        if not requested:
+            return {}
+        try:
+            url = f"http://hq.sinajs.cn/list={','.join(requested)}"
+            response = self._session.get(
+                url,
+                headers={
                     'Referer': 'http://finance.sina.com.cn',
-                    'User-Agent': 'Mozilla/5.0'
+                    'User-Agent': 'Mozilla/5.0',
+                },
+                timeout=self.http_timeout,
+            )
+            response.encoding = 'gbk'
+            results = {}
+            for match in re.finditer(
+                r'var\s+hq_str_([a-z]{2}\d{6})="([^"]*)"',
+                response.text,
+                flags=re.IGNORECASE,
+            ):
+                symbol, raw = match.groups()
+                fields = raw.split(',')
+                if len(fields) < 32:
+                    continue
+                pre_close = float(fields[2] or 0)
+                price = float(fields[3] or 0)
+                results[symbol.lower()] = {
+                    'name': fields[0],
+                    'open': float(fields[1] or 0),
+                    'pre_close': pre_close,
+                    'price': price,
+                    'high': float(fields[4] or 0),
+                    'low': float(fields[5] or 0),
+                    'volume': int(float(fields[8] or 0)),
+                    'amount': float(fields[9] or 0),
+                    'time': fields[30],
+                    'date': fields[31],
+                    'change': price - pre_close,
+                    'change_pct': (price / pre_close - 1) * 100 if pre_close > 0 else 0,
                 }
-                
-                response = self._session.get(url, headers=headers, timeout=5)
-                response.encoding = 'gbk'
-                
-                # 解析数据
-                data = response.text
-                if '=""' not in data:
-                    # 提取数据
-                    match = re.search(r'"(.+)"', data)
-                    if match:
-                        fields = match.group(1).split(',')
-                        if len(fields) >= 32:
-                            results[symbol] = {
-                                'name': fields[0],
-                                'open': float(fields[1]),
-                                'pre_close': float(fields[2]),
-                                'price': float(fields[3]),
-                                'high': float(fields[4]),
-                                'low': float(fields[5]),
-                                'volume': int(float(fields[8])),
-                                'amount': float(fields[9]),
-                                'time': fields[30],
-                                'date': fields[31],
-                                'change': float(fields[3]) - float(fields[2]),
-                                'change_pct': (float(fields[3]) - float(fields[2])) / float(fields[2]) * 100
-                            }
-            except Exception as e:
-                print(f"获取{symbol}行情失败: {e}")
-        
-        return results
+            return results
+        except Exception as exc:
+            print(f"批量获取新浪行情失败: {exc}")
+            return {}
     
     def get_realtime_quote_tencent(self, symbols: List[str]) -> Dict:
         """
@@ -91,66 +101,74 @@ class RealtimeData:
                   turnover_pct(换手率%), limit_up(涨停价), limit_down(跌停价),
                   vol_ratio(量比), pe_static(PE静), amplitude_pct(振幅%)
         """
-        results = {}
-
-        for symbol in symbols:
-            try:
-                # 转换代码格式 (腾讯用 sh600000 格式)
-                code = symbol[2:] if symbol.startswith(('sh', 'sz', 'bj')) else symbol
-                market = 'sh' if (symbol.startswith('sh') or code.startswith(('6', '9'))) else 'sz'
-                tc_symbol = f"{market}{code}"
-
-                url = f"http://qt.gtimg.cn/q={tc_symbol}"
-                headers = {
+        requested = list(dict.fromkeys(symbols))
+        if not requested:
+            return {}
+        normalized = []
+        for symbol in requested:
+            code = symbol[2:] if symbol.startswith(('sh', 'sz', 'bj')) else symbol
+            if symbol.startswith('bj') or code.startswith(('4', '8')):
+                market = 'bj'
+            elif symbol.startswith('sh') or code.startswith(('6', '9', '5')):
+                market = 'sh'
+            else:
+                market = 'sz'
+            normalized.append(f"{market}{code}")
+        try:
+            response = self._session.get(
+                f"http://qt.gtimg.cn/q={','.join(normalized)}",
+                headers={
                     'Referer': 'http://finance.qq.com',
-                    'User-Agent': 'Mozilla/5.0'
+                    'User-Agent': 'Mozilla/5.0',
+                },
+                timeout=self.http_timeout,
+            )
+            response.encoding = 'gbk'
+            results = {}
+            for match in re.finditer(
+                r'v_([a-z]{2}\d{6})="([^"]*)"',
+                response.text,
+                flags=re.IGNORECASE,
+            ):
+                symbol, raw = match.groups()
+                fields = raw.split('~')
+                if len(fields) < 53:
+                    continue
+
+                def _f(index):
+                    try:
+                        return float(fields[index]) if fields[index] else 0.0
+                    except (ValueError, TypeError, IndexError):
+                        return 0.0
+
+                results[symbol.lower()] = {
+                    'name': fields[1],
+                    'code': fields[2],
+                    'price': _f(3),
+                    'pre_close': _f(4),
+                    'open': _f(5),
+                    'volume': int(_f(6) * 100),
+                    'amount': _f(37) * 10000,
+                    'high': _f(33),
+                    'low': _f(34),
+                    'change': _f(31),
+                    'change_pct': _f(32),
+                    'time': fields[30],
+                    'pe_ttm': _f(39),
+                    'pb': _f(46),
+                    'mcap_yi': _f(44),
+                    'float_mcap_yi': _f(45),
+                    'turnover_pct': _f(38),
+                    'limit_up': _f(47),
+                    'limit_down': _f(48),
+                    'vol_ratio': _f(49),
+                    'pe_static': _f(52),
+                    'amplitude_pct': _f(43),
                 }
-
-                response = self._session.get(url, headers=headers, timeout=5)
-                response.encoding = 'gbk'
-
-                # 解析数据(腾讯88字段, ~分隔)
-                data = response.text
-                match = re.search(r'"(.+)"', data)
-                if match:
-                    fields = match.group(1).split('~')
-                    if len(fields) >= 53:
-                        def _f(idx):
-                            try:
-                                return float(fields[idx]) if fields[idx] else 0.0
-                            except (ValueError, TypeError):
-                                return 0.0
-
-                        results[symbol] = {
-                            # 基础行情(与旧版兼容)
-                            'name': fields[1],
-                            'code': fields[2],
-                            'price': _f(3),
-                            'pre_close': _f(4),
-                            'open': _f(5),
-                            'volume': int(_f(6) * 100),
-                            'amount': _f(37) * 10000,
-                            'high': _f(33),
-                            'low': _f(34),
-                            'change': _f(31),
-                            'change_pct': _f(32),
-                            'time': fields[30],
-                            # 估值/基本面(增强字段)
-                            'pe_ttm': _f(39),
-                            'pb': _f(46),
-                            'mcap_yi': _f(44),
-                            'float_mcap_yi': _f(45),
-                            'turnover_pct': _f(38),
-                            'limit_up': _f(47),
-                            'limit_down': _f(48),
-                            'vol_ratio': _f(49),
-                            'pe_static': _f(52),
-                            'amplitude_pct': _f(43),
-                        }
-            except Exception as e:
-                print(f"获取{symbol}行情失败: {e}")
-
-        return results
+            return results
+        except Exception as exc:
+            print(f"批量获取腾讯行情失败: {exc}")
+            return {}
 
     def get_realtime_quote_tencent_rich(self, symbols: List[str]) -> Dict:
         """腾讯行情增强版(与 get_realtime_quote_tencent 相同, 显式语义别名)"""
@@ -179,18 +197,25 @@ class RealtimeData:
             url = "https://push2.eastmoney.com/api/qt/ulist.np/get"
             params = {
                 'fltt': '2',
-                'fields': 'f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f14,f15,f16,f17,f18',
+                'fields': 'f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f13,f14,f15,f16,f17,f18',
                 'secids': ','.join(secids)
             }
 
             from ..em_client import em_get
-            response = em_get(url, params=params, timeout=5)
+            response = em_get(url, params=params, timeout=self.http_timeout)
             data = response.json()
             
             if data and data.get('data') and data['data'].get('diff'):
-                for item in data['data']['diff']:
+                diff = data['data']['diff']
+                rows = diff.values() if isinstance(diff, dict) else diff
+                for item in rows:
                     symbol_code = item.get('f12', '')
-                    market = 'sh' if item.get('f13', 0) == 1 else 'sz'
+                    if item.get('f13', 0) == 1:
+                        market = 'sh'
+                    elif str(symbol_code).startswith(('4', '8')):
+                        market = 'bj'
+                    else:
+                        market = 'sz'
                     symbol = f"{market}{symbol_code}"
                     
                     results[symbol] = {
@@ -227,9 +252,49 @@ class RealtimeData:
         except Exception:
             return {}
 
+    @staticmethod
+    def _is_valid_quote(quote: Dict) -> bool:
+        if not isinstance(quote, dict) or not quote:
+            return False
+        try:
+            price = float(quote.get('price', 0) or 0)
+            change_pct = float(quote.get('change_pct', 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        return 0 < price <= 10_000 and abs(change_pct) <= 30.5
+
+    def _record_source_health(
+        self,
+        source: str,
+        requested: int,
+        resolved: int,
+        latency_ms: float,
+        error: str = "",
+    ):
+        with self._health_lock:
+            previous = self._source_health.get(source, {})
+            self._source_health[source] = {
+                'status': 'healthy' if resolved > 0 else 'degraded',
+                'requested': int(requested),
+                'resolved': int(resolved),
+                'latency_ms': round(float(latency_ms), 2),
+                'success_count': int(previous.get('success_count', 0)) + (1 if resolved > 0 else 0),
+                'failure_count': int(previous.get('failure_count', 0)) + (1 if resolved <= 0 else 0),
+                'last_success_at': (
+                    datetime.now().isoformat()
+                    if resolved > 0
+                    else previous.get('last_success_at', '')
+                ),
+                'last_error': str(error or '')[:200],
+            }
+
+    def get_source_health(self) -> Dict[str, Dict]:
+        with self._health_lock:
+            return {source: dict(status) for source, status in self._source_health.items()}
+
     def get_quotes(self, symbols: List[str], sources: Optional[List[str]] = None) -> Dict:
         """
-        统一实时行情入口：按 sources 顺序逐源尝试，第一个返回非空即用。
+        统一实时行情入口：按股票逐源补全，过滤无效价格并标记实际来源。
 
         Args:
             symbols: 股票代码列表
@@ -248,17 +313,44 @@ class RealtimeData:
             'tencent': self.get_realtime_quote_tencent,
         }
 
-        for src in sources:
-            fn = dispatch.get(str(src).lower())
+        requested_symbols = list(dict.fromkeys(str(symbol) for symbol in symbols if symbol))
+        remaining = set(requested_symbols)
+        results: Dict[str, Dict] = {}
+        for source in sources:
+            source_name = str(source).lower()
+            fn = dispatch.get(source_name)
             if fn is None:
                 continue
+            pending = [symbol for symbol in requested_symbols if symbol in remaining]
+            if not pending:
+                break
+            started = time.perf_counter()
+            resolved = 0
+            error = ""
             try:
-                quotes = fn(symbols)
-                if quotes:
-                    return quotes
-            except Exception:
-                continue
-        return {}
+                quotes = fn(pending) or {}
+                received_at = datetime.now().isoformat()
+                for symbol in pending:
+                    quote = quotes.get(symbol)
+                    if not self._is_valid_quote(quote):
+                        continue
+                    payload = dict(quote)
+                    payload['symbol'] = symbol
+                    payload['data_source'] = source_name
+                    payload['received_at'] = received_at
+                    results[symbol] = payload
+                    remaining.discard(symbol)
+                    resolved += 1
+            except Exception as exc:
+                error = str(exc)
+            self._record_source_health(
+                source_name,
+                len(pending),
+                resolved,
+                (time.perf_counter() - started) * 1000,
+                error,
+            )
+        return results
 
     def get_stock_quote(self, symbol: str, source: str = 'sina') -> Dict:
         """
@@ -301,8 +393,10 @@ class RealtimeData:
         """
         try:
             from ..sources.quote import MootdxSource
-            m = MootdxSource()
-            return m.kline(symbol, category, offset)
+            with self._mootdx_lock:
+                if self._mootdx_source is None:
+                    self._mootdx_source = MootdxSource()
+                return self._mootdx_source.kline(symbol, category, offset)
         except Exception:
             return pd.DataFrame()
 

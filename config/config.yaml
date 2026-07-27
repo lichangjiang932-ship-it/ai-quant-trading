@@ -1,0 +1,182 @@
+agents:
+  analysts:
+  - technical
+  - sentiment
+  - news
+  - fundamentals
+  - capital
+  api_key_env: DEEPSEEK_API_KEY
+  base_url: https://api.deepseek.com
+  confidence_threshold: 0.6
+  decision_interval: 300
+  deep_think_model: deepseek-chat
+  enabled: false
+  max_debate_rounds: 1
+  provider: deepseek
+  quick_think_model: deepseek-chat
+  temperature: 0.3
+  use_memory: true
+ai:
+  api_key_env: DEEPSEEK_API_KEY
+  base_url: https://api.deepseek.com
+  confidence_threshold: 0.55
+  decision_interval: 30
+  enabled: false
+  model: deepseek-chat
+  provider: deepseek
+  temperature: 0.2
+  use_openbb: false
+alerts:
+  large_change_pct: 5
+  limit_down_pct: -9.8
+  limit_up_pct: 9.8
+  volume_surge_ratio: 3
+approval:
+  audit_log_limit: 200
+  dashboard_signal_refresh_seconds: 300
+  max_price_drift_pct: 1.5
+  max_signal_age_seconds: 1800
+  min_buy_confidence: 0.58
+  min_data_quality_score: 70
+  min_risk_reward: 1.35
+  min_validation_avg_return: 0
+  min_validation_samples: 3
+  min_validation_win_rate: 45
+  validation_cache_seconds: 1800
+broker:
+  account_id: ''
+  mini_qmt_path: ''
+  type: simulated
+capital:
+  block_trade: true
+  dividend: true
+  enabled: true
+  fund_flow_120d: true
+  holder_change: true
+  margin_trading: true
+commission:
+  min: 5
+  rate: 0.0003
+  stamp_tax: 0.0005
+data_source:
+  baidu:
+    enabled: true
+  em_min_interval: 1.0
+  history: auto
+  history_order:
+  - mootdx
+  - baostock
+  - eastmoney
+  - yfinance
+  - akshare
+  mootdx:
+    enabled: true
+  realtime: tencent
+  realtime_order:
+  - pytdx
+  - tencent
+  - eastmoney
+  - sina
+  tencent:
+    enabled: true
+logging:
+  level: INFO
+  log_dir: logs
+ml:
+  confidence_threshold: 0.55
+  enabled: false
+  lookback_period: 60
+  model_type: random_forest
+  prediction_horizon: 5
+  retrain_interval: 60
+  train_window: 300
+notification:
+  console:
+    enabled: true
+    use_color: true
+  dingtalk:
+    enabled: false
+    secret: ''
+    webhook_url: ''
+  enabled: true
+  file:
+    enabled: true
+    filename: notifications.log
+    log_dir: logs
+  min_level: info
+  telegram:
+    bot_token: ''
+    chat_id: ''
+    enabled: false
+  webhook:
+    enabled: false
+    url: ''
+  wechat_work:
+    enabled: false
+    mentioned_list: []
+    webhook_url: ''
+premarket:
+  auto_execute: false
+  buy_probability: 0.58
+  market_holidays: []
+  max_entries: 1
+  max_gap_up_pct: 2.5
+  min_expected_holding_pct: 0.45
+  pool: watchlist
+  scheduler_enabled: true
+  top: 5
+professional:
+  benchmark_symbol: sh000001
+  market_shock_pct: -2.0
+  max_daily_new_exposure: 0.2
+  max_stale_sessions: 2
+  neutral_position_multiplier: 0.5
+  unknown_position_multiplier: 0.5
+risk:
+  max_daily_loss: 1.0
+  max_drawdown: 1.0
+  max_orders_per_day: 100
+  max_position_size: 1.0
+  max_risk_per_trade: 0.01
+  max_total_position: 1.0
+  partial_tp_levels: []
+  stop_loss: 0.05
+  take_profit: 0.1
+  trailing_stop: null
+server:
+  host: 127.0.0.1
+  port: 8080
+signals:
+  dragon_tiger: true
+  enabled: true
+  hot_reasons: true
+  industry_ranking: true
+  lockup_expiry: true
+  northbound: true
+strategy:
+  entry_threshold: 0.03
+  exit_threshold: 0.5
+  long_window: 20
+  lookback_period: 20
+  short_window: 5
+  type: agents
+trading:
+  auto_trade: false
+  enforce_market_hours: false
+  initial_capital: 100000
+  news_update_interval: 60
+  slippage: 0.0001
+  symbols:
+  - sh600000
+  - sh600104
+  - sz000001
+  - sz000002
+  update_interval: 3
+  watchlist: []
+trading_hours:
+  after_hours_end: '15:30'
+  afternoon_end: '15:00'
+  afternoon_start: '13:00'
+  morning_end: '11:30'
+  morning_start: 09:30
+  pre_market_start: 09:15

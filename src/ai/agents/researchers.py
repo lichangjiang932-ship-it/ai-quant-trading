@@ -17,8 +17,18 @@ class ResearchDebate:
 
     def run(self, symbol: str, analyst_reports: List[Dict], memory_text: str = '') -> Dict:
         """返回 {stance, score, bull, bear, conclusion, transcript}"""
-        avg_score = (sum(r.get('score', 0) for r in analyst_reports) / len(analyst_reports)
-                     if analyst_reports else 0.0)
+        # 信息优先: 有明确观点(score!=0)的分析师全权重, 无数据(score=0)的降到 0.25 权重,
+        # 避免"2个恒空分析师把均分拉向0导致一律观望"。
+        if analyst_reports:
+            num, den = 0.0, 0.0
+            for r in analyst_reports:
+                s = float(r.get('score', 0) or 0)
+                w = 1.0 if abs(s) > 1e-6 else 0.25
+                num += s * w
+                den += w
+            avg_score = num / den if den > 0 else 0.0
+        else:
+            avg_score = 0.0
 
         summary = self._format_reports(analyst_reports)
         transcript: List[str] = []

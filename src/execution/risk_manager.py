@@ -1,4 +1,4 @@
-"""
+﻿"""
 风险管理器
 =========
 
@@ -32,6 +32,8 @@ class OrderRequest:
     price: float
     portfolio_value: float = 0
     current_position_value: float = 0
+    current_symbol_value: float = 0
+    current_industry_value: float = 0
     reason: str = ""
 
 
@@ -166,10 +168,11 @@ class RiskManager:
                     )
 
             new_position_value = order.quantity * order.price
+            post_trade_symbol_value = order.current_symbol_value + new_position_value
             if order.portfolio_value > 0:
-                if new_position_value / order.portfolio_value > self.max_position_size:
+                if post_trade_symbol_value / order.portfolio_value > self.max_position_size:
                     violations.append(
-                        f"单股仓位 {new_position_value / order.portfolio_value:.2%} > {self.max_position_size:.0%}"
+                        f"单股仓位 {post_trade_symbol_value / order.portfolio_value:.2%} > {self.max_position_size:.0%}"
                     )
                 total_exposure = order.current_position_value + new_position_value
                 if total_exposure / order.portfolio_value > self.max_total_position:
@@ -179,10 +182,19 @@ class RiskManager:
                 if self._industry_map:
                     industry = self._industry_map.get(order.symbol)
                     if industry:
-                        violations_check = self._check_industry(industry, new_position_value, order.portfolio_value)
+                        violations_check = self._check_industry(
+                            industry,
+                            order.current_industry_value + new_position_value,
+                            order.portfolio_value,
+                        )
                         if violations_check:
                             violations.append(violations_check)
-            if not self.check_position_size(order.symbol, order.quantity, order.price, order.portfolio_value):
+            if not self.check_position_size(
+                order.symbol,
+                int(post_trade_symbol_value / order.price),
+                order.price,
+                order.portfolio_value,
+            ):
                 violations.append("单股仓位超限")
 
         if violations:
@@ -197,10 +209,7 @@ class RiskManager:
     def _check_industry(self, industry: str, new_value: float, portfolio_value: float) -> Optional[str]:
         if portfolio_value <= 0:
             return None
-        same_industry_value = sum(
-            v for s, v in self._industry_map.items()
-            if self._industry_map[s] == industry
-        ) * 0 + new_value
+        same_industry_value = new_value
         if same_industry_value / portfolio_value > self.max_single_industry_pct:
             return f"行业 {industry} 集中度 {same_industry_value / portfolio_value:.2%} > {self.max_single_industry_pct:.0%}"
         return None
@@ -208,7 +217,15 @@ class RiskManager:
     def _suggest_qty(self, order: OrderRequest, violations: List[str]) -> int:
         if order.price <= 0 or order.portfolio_value <= 0:
             return 0
-        max_qty_by_size = int(order.portfolio_value * self.max_position_size / order.price)
+        symbol_room = max(
+            order.portfolio_value * self.max_position_size - order.current_symbol_value,
+            0,
+        )
+        total_room = max(
+            order.portfolio_value * self.max_total_position - order.current_position_value,
+            0,
+        )
+        max_qty_by_size = int(min(symbol_room, total_room) / order.price)
         if order.side == OrderSide.BUY:
             return max(0, max_qty_by_size // 100 * 100)
         return order.quantity

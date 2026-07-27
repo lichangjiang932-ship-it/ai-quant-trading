@@ -6,6 +6,8 @@ trading:
   initial_capital: 1000000
   # 自动交易开关
   auto_trade: false
+  # 是否只允许在 A 股连续竞价时段提交模拟订单
+  enforce_market_hours: false
   # 行情更新间隔（秒）
   update_interval: 3
   # 新闻更新间隔（秒）
@@ -47,6 +49,18 @@ strategy:
   # 均值回归策略参数
   exit_threshold: 0.5
 
+  # 策略页结果先读持久化缓存，过期分析在后台执行
+  cache_seconds: 300
+  # 行情源失败后的后台重试间隔，手动刷新不受此限制
+  retry_seconds: 30
+
+  # 亏损持仓五维修复评分阈值
+  recovery_sell_score: 38
+  recovery_reduce_score: 52
+  recovery_add_score: 72
+  # 亏损超过该比例后禁止通过补仓摊低成本
+  recovery_max_add_loss_pct: 8
+
 # 风险管理
 risk:
   # 最大仓位比例（占总资产）
@@ -75,14 +89,60 @@ trading_hours:
   # 盘后
   after_hours_end: "15:30"
 
+# 盘前计划：08:20 基于上一交易日以前的数据生成，09:30 后用真实价格复核
+premarket:
+  scheduler_enabled: true
+  pool: watchlist
+  top: 5
+  max_entries: 1
+  buy_probability: 0.58
+  min_expected_holding_pct: 0.45
+  max_gap_up_pct: 2.5
+  # 默认关闭；开启后也只会在模拟盘于 09:31 复核并执行排名第一的计划
+  auto_execute: false
+  # 可按 YYYY-MM-DD 维护休市日；周末会自动跳过
+  market_holidays: []
+
+# 专业决策门禁：不替换原策略，只负责拦截脏数据、弱市开仓和组合超配
+professional:
+  benchmark_symbol: sh000001
+  max_stale_sessions: 2
+  neutral_position_multiplier: 0.5
+  unknown_position_multiplier: 0.5
+  max_daily_new_exposure: 0.20
+  market_shock_pct: -2.0
+
+# AI/策略订单审批：所有自动信号必须重新取价、校验历史样本并记录审批日志
+approval:
+  max_signal_age_seconds: 1800
+  max_price_drift_pct: 1.5
+  min_buy_confidence: 0.58
+  min_risk_reward: 1.35
+  min_data_quality_score: 70
+  min_validation_samples: 3
+  min_validation_win_rate: 45
+  min_validation_avg_return: 0
+  validation_cache_seconds: 1800
+  dashboard_signal_refresh_seconds: 300
+  audit_log_limit: 200
+
+# AI 选股盘中入场门禁：避免只追逐当日暴涨股和冲高回落股
+ai_pick:
+  max_day_gain_pct: 4.5
+  min_day_change_pct: -2.5
+  max_open_gap_pct: 3.0
+  max_pullback_from_high_pct: 2.2
+  max_negative_drift_pct: 2.5
+  min_net_target_return_pct: 2.0
+
 # 佣金配置
 commission:
   # 佣金费率
   rate: 0.0003
   # 最低佣金
   min: 5
-  # 印花税率（卖出时收取）
-  stamp_tax: 0.001
+  # 股票卖出印花税率；ETF 卖出自动免收
+  stamp_tax: 0.0005
 
 # 告警配置
 alerts:
@@ -106,7 +166,7 @@ logging:
 data_source:
   # 实时行情数据源：eastmoney（推荐）, sina, tencent
   realtime: eastmoney
-  # 实时行情源优先级（逐个回退，第一个取到数据即用）
+  # 实时行情源优先级（按股票逐源补全，单个源缺失时继续回退）
   # pytdx=通达信TCP协议(需 pip install pytdx，最稳)；未装会自动跳过
   realtime_order: [pytdx, eastmoney, sina, tencent]
   # 历史数据数据源：auto（自动选择）, akshare, eastmoney, yfinance
@@ -115,6 +175,8 @@ data_source:
   history_order: [akshare, baostock, eastmoney, yfinance]
   # 东财请求最小间隔(秒)，防止高频被封 IP。批量筛选可调大到 1.5~2
   em_min_interval: 1.0
+  # 日线本地缓存，减少盘前计划、回测和图表重复拉取
+  daily_cache_seconds: 1800
 
 # AI 大模型决策配置（strategy.type=ai 时生效）
 ai:
@@ -167,3 +229,8 @@ agents:
     - capital
   # 反思记忆：平仓后记录盈亏与经验，下次该股决策时回灌（从历史中学习）
   use_memory: true
+
+# 个人使用默认仅监听本机，避免局域网其他设备直接访问交易接口
+server:
+  host: 127.0.0.1
+  port: 8080

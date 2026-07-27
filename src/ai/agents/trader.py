@@ -27,10 +27,12 @@ class Trader:
         return self._rule_decide(symbol, score, has_position, debate)
 
     def _decide_via_llm(self, symbol, reports, debate, context, memory_text) -> Optional[Dict]:
-        sys = ('你是交易员,需综合分析师报告、多空辩论结论与历史经验,给出最终交易决策。'
+        sys = ('你是一名主动型交易员,需综合分析师报告、多空辩论结论与历史经验,给出明确的交易决策。'
                '只输出JSON: {"action":"buy/sell/hold","confidence":0到1小数,'
                '"target_pct":建议仓位百分比0到100的数,"reason":"不超过100字中文理由"}。'
-               '决策要稳健:信息矛盾或不足时倾向hold。')
+               '决策原则:当多数分析师看多且有基本面/技术面/情绪面支撑时,应给出 buy 而非回避;'
+               '当多数看空或出现重大利空时给出 sell/hold。只有证据严重不足或高度分歧时才 hold。'
+               '不要因为存在单一相反因素(如资金面短期流出)就一律观望——权衡多空强弱后果断给出方向。')
         summary = "\n".join(
             f"- {r.get('name')}: {r.get('stance')} {r.get('score'):+.2f} | {r.get('report','')[:100]}"
             for r in reports
@@ -70,10 +72,11 @@ class Trader:
 
     def _rule_decide(self, symbol, score, has_position, debate) -> Dict:
         action, conf, target = 'hold', min(abs(score), 0.5), 0.0
-        if score > 0.2 and not has_position:
-            action, conf, target = 'buy', min(abs(score), 1.0), min(abs(score) * 100, 30)
-        elif score < -0.15 and has_position:
-            action, conf, target = 'sell', min(abs(score), 1.0), 0.0
+        # 信息优先: 买入阈值 0.2 -> 0.12, 让偏多的研究结论更容易转化为买入建议
+        if score > 0.12 and not has_position:
+            action, conf, target = 'buy', min(0.5 + abs(score), 1.0), min(abs(score) * 100, 30)
+        elif score < -0.12 and has_position:
+            action, conf, target = 'sell', min(0.5 + abs(score), 1.0), 0.0
         reason = f"[交易员·规则] 研究评分{score:+.2f} -> {action}。{debate.get('conclusion','')[:60]}"
         return {'action': action, 'confidence': round(conf, 3),
                 'target_pct': round(target, 1), 'reason': reason, 'source': 'fallback'}

@@ -287,7 +287,7 @@ def _make_config(strategy_type):
         'commission': {
             'rate': 0.0003,
             'min': 5,
-            'stamp_tax': 0.001,
+            'stamp_tax': 0.0005,
         },
         'notification': {
             'enabled': True,
