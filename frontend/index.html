@@ -9,7 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 :root{
-  --bg:#080c14;--bg2:#060910;--panel:#0d1420;--panel2:#0a101a;--line:rgba(255,255,255,.06);--line2:rgba(255,255,255,.09);
+  --bg:#0d1117;--bg2:#0a0e13;--panel:#161b22;--panel2:#11171f;--line:rgba(255,255,255,.06);--line2:rgba(255,255,255,.09);
   --ink:#e9edf4;--ink-dim:#8894a8;--ink-faint:#546078;
   --brass:#d4a24e;--brass-dim:#a9823f;--brass-glow:rgba(212,162,78,.10);
   --accent:#3b82f6;--accent-dim:#2563eb;--accent-glow:rgba(59,130,246,.12);--accent-soft:rgba(59,130,246,.06);
@@ -21,8 +21,8 @@
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;font-feature-settings:"cv02","cv03","cv04","cv09"}
-body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;background:radial-gradient(1100px 480px at 78% -8%,var(--accent-glow),transparent 60%),radial-gradient(600px 400px at 22% 92%,var(--brass-glow),transparent 60%);opacity:.7}
-body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;background-image:radial-gradient(circle,rgba(255,255,255,.06) 1px,transparent 1px);background-size:22px 22px;opacity:.3}
+body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;background:radial-gradient(900px 400px at 75% -5%,rgba(59,130,246,.06),transparent 60%),radial-gradient(500px 350px at 20% 90%,rgba(212,162,78,.06),transparent 60%),radial-gradient(700px 300px at 50% 50%,rgba(139,148,168,.03),transparent 70%);opacity:.8}
+body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;background-image:radial-gradient(circle,rgba(255,255,255,.04) 1px,transparent 1px);background-size:24px 24px;opacity:.25}
 button,input,select{font:inherit;color:inherit}
 button{cursor:pointer}
 button:disabled{cursor:not-allowed;opacity:.5;filter:saturate(.45)}
@@ -42,7 +42,7 @@ button:disabled{cursor:not-allowed;opacity:.5;filter:saturate(.45)}
 
 /* ── shell ── */
 .main{flex:1;min-width:0;display:flex;flex-direction:column}
-.topbar{height:62px;background:rgba(8,12,20,.88);backdrop-filter:blur(16px) saturate(1.2);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:16px;padding:0 24px;position:sticky;top:0;z-index:4}
+.topbar{height:62px;background:rgba(13,17,23,.85);backdrop-filter:blur(16px) saturate(1.2);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:16px;padding:0 24px;position:sticky;top:0;z-index:4}
 .title{min-width:170px}
 .title h1{font-size:16px;font-weight:700;letter-spacing:-.01em;margin:0 0 2px}
 .title p{margin:0;color:var(--ink-dim);font-size:12px}
@@ -73,7 +73,7 @@ button:disabled{cursor:not-allowed;opacity:.5;filter:saturate(.45)}
 .kpis{grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:16px}
 
 /* ── panels & cards ── */
-.card,.panel{position:relative;background:linear-gradient(180deg,rgba(17,24,39,.7),rgba(13,20,32,.7));border:1px solid var(--line);border-radius:var(--r);backdrop-filter:blur(8px)}
+.card,.panel{position:relative;background:linear-gradient(180deg,rgba(22,27,34,.7),rgba(17,23,31,.7));border:1px solid var(--line);border-radius:var(--r);backdrop-filter:blur(8px)}
 .panel{padding:16px;min-width:0}
 .card{padding:15px 16px;transition:border-color .18s,box-shadow .18s}
 .card:hover{border-color:var(--line2);box-shadow:0 0 0 1px rgba(255,255,255,.03)}
@@ -253,7 +253,7 @@ tbody tr:last-child td{border-bottom:0}
 .status-time{font-variant-numeric:tabular-nums;min-width:150px;text-align:right}
 
 /* ── sentiment strip ── */
-.senti-bar{display:flex;flex-wrap:wrap;gap:22px;align-items:center;background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:var(--r);padding:13px 18px;margin-bottom:16px}
+.senti-bar{display:flex;flex-wrap:wrap;gap:22px;align-items:center;background:linear-gradient(180deg,rgba(22,27,34,.7),rgba(17,23,31,.7));border:1px solid var(--line);border-radius:var(--r);padding:13px 18px;margin-bottom:16px}
 .senti-bar .si{display:flex;flex-direction:column;gap:3px}
 .senti-bar .si .lb{font-size:11px;color:var(--ink-faint);letter-spacing:.04em}
 .senti-bar .si .vv{font-size:17px;font-weight:600;font-family:var(--mono);font-variant-numeric:tabular-nums}
@@ -396,7 +396,7 @@ function renderStatus(){const ok=state.online,s=state.system||{},dot=$('statusDo
 function renderKpis(){const a=state.account,pnl=Number(a.profit??((a.total_asset||0)-(a.initial_capital||0)));setNum($('kpiTotal'),money(a.total_asset));setNum($('kpiCash'),money(a.cash));setNum($('kpiPnl'),money(pnl),'metric '+(pnl>=0?'up':'down'));setNum($('kpiExposure'),pct(((a.market_value||0)/Math.max(a.total_asset||1,1))*100),'metric blue')}
 function q(sym=state.current){return state.quotes[sym]||{}}
 function qName(sym=state.current){return q(sym).name||names[sym]||sym}
-function _chartTip(){let t=document.getElementById('chartTip');if(!t){t=document.createElement('div');t.id='chartTip';t.style.cssText='position:fixed;z-index:30;pointer-events:none;background:#0d1420;border:1px solid rgba(255,255,255,.08);border-radius:7px;padding:9px 11px;font-size:12px;color:#e9edf4;font-variant-numeric:tabular-nums;box-shadow:0 10px 30px rgba(0,0,0,.5);display:none;line-height:1.7;white-space:nowrap';document.body.appendChild(t)}return t}
+function _chartTip(){let t=document.getElementById('chartTip');if(!t){t=document.createElement('div');t.id='chartTip';t.style.cssText='position:fixed;z-index:30;pointer-events:none;background:#161b22;border:1px solid rgba(255,255,255,.08);border-radius:7px;padding:9px 11px;font-size:12px;color:#e9edf4;font-variant-numeric:tabular-nums;box-shadow:0 10px 30px rgba(0,0,0,.5);display:none;line-height:1.7;white-space:nowrap';document.body.appendChild(t)}return t}
 function drawChart(id,data,mode='price'){const box=$(id);if(!box)return;box.style.position='relative';const W=box.clientWidth||600,H=box.clientHeight||260;if(!data||!data.length){box.innerHTML='<div class="muted" style="padding:30px">暂无K线数据</div>';box.onmousemove=null;box.onmouseleave=null;return}
   const isEq=mode==='equity';const PL=8,PR=52,PT=12,PB=22;const totalH=H-PT-PB;
   const volH=isEq?0:Math.max(totalH*0.16,20),gap=isEq?0:8;const priceH=totalH-volH-gap;const plotW=W-PL-PR;

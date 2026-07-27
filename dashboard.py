@@ -56,10 +56,10 @@ _DARK_CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
 
 :root {
-  --bg-deep: #070b11;
-  --bg-base: #0b1018;
-  --bg-raised: #111827;
-  --bg-overlay: #151d2c;
+  --bg-deep: #0a0e14;
+  --bg-base: #0d1117;
+  --bg-raised: #161b22;
+  --bg-overlay: #1a2029;
   --border-subtle: rgba(255,255,255,0.06);
   --border-default: rgba(255,255,255,0.08);
   --border-strong: rgba(255,255,255,0.12);
@@ -97,23 +97,37 @@ _DARK_CSS = """
     inset: 0;
     pointer-events: none;
     z-index: 0;
-    opacity: 0.028;
-    background-image: radial-gradient(circle, #ffffff 1px, transparent 1px);
-    background-size: 20px 20px;
+    opacity: 0.022;
+    background-image: radial-gradient(circle, rgba(255,255,255,0.7) 1px, transparent 1px);
+    background-size: 24px 24px;
 }
 
 /* ── gradient accents ── */
 .stApp::after {
     content: "";
     position: fixed;
-    top: -30%;
-    right: -15%;
-    width: 800px;
-    height: 600px;
+    top: -25%;
+    right: -12%;
+    width: 700px;
+    height: 500px;
     pointer-events: none;
     z-index: 0;
-    opacity: 0.06;
+    opacity: 0.05;
     background: radial-gradient(ellipse, var(--accent) 0%, transparent 70%);
+}
+
+/* ── warm ambient glow ── */
+section[data-testid="stSidebar"] + div::before {
+    content: "";
+    position: fixed;
+    bottom: -20%;
+    left: -10%;
+    width: 500px;
+    height: 400px;
+    pointer-events: none;
+    z-index: 0;
+    opacity: 0.04;
+    background: radial-gradient(ellipse, rgba(212,162,78,0.6) 0%, transparent 70%);
 }
 
 /* ── sidebar ── */
@@ -976,7 +990,7 @@ def render_ai_cockpit():
                     yaxis_title='价格',
                     hovermode='x unified',
                     height=500,
-                    paper_bgcolor='#0b1018',
+                    paper_bgcolor='#0d1117',
                     plot_bgcolor='rgba(255,255,255,0.015)',
                     font=dict(color='#8b95a8'),
                     legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
