@@ -190,3 +190,58 @@ class OrderManager:
             return pd.DataFrame()
         
         return pd.DataFrame([o.to_dict() for o in self.order_history])
+
+    # ── 新增: 订单过期与批量管理 ──
+
+    def expire_stale_orders(self, max_age_seconds: int = 300) -> List[Order]:
+        """将超过指定秒数的待处理订单标记为过期取消。"""
+        now = datetime.now()
+        expired = []
+        for order in list(self.orders):
+            if order.status == OrderStatus.PENDING:
+                age = (now - order.created_at).total_seconds()
+                if age > max_age_seconds:
+                    order.status = OrderStatus.CANCELLED
+                    order.updated_at = now
+                    self.order_history.append(order)
+                    self.orders.remove(order)
+                    expired.append(order)
+        return expired
+
+    def cancel_all_pending(self) -> int:
+        """取消所有待处理订单。返回取消数量。"""
+        count = 0
+        for order in list(self.orders):
+            if order.status == OrderStatus.PENDING:
+                order.status = OrderStatus.CANCELLED
+                order.updated_at = datetime.now()
+                self.order_history.append(order)
+                self.orders.remove(order)
+                count += 1
+        return count
+
+    def get_orders_by_symbol(self, symbol: str) -> List[Order]:
+        """获取指定股票的所有订单。"""
+        return [o for o in self.orders + [
+            h for h in self.order_history
+            if not hasattr(h, 'orders') or h not in self.orders
+        ] if o.symbol == symbol]
+
+    def get_orders_by_status(self, status: OrderStatus) -> List[Order]:
+        """按状态筛选订单。"""
+        return [o for o in self.orders if o.status == status]
+
+    def get_order_summary(self) -> Dict:
+        """订单摘要统计。"""
+        pending = len(self.get_orders_by_status(OrderStatus.PENDING))
+        filled = sum(1 for o in self.order_history if o.status == OrderStatus.FILLED)
+        rejected = sum(1 for o in self.order_history if o.status == OrderStatus.REJECTED)
+        cancelled = sum(1 for o in self.order_history if o.status == OrderStatus.CANCELLED)
+        return {
+            "pending": pending,
+            "filled_today": filled,
+            "rejected_today": rejected,
+            "cancelled_today": cancelled,
+            "total_history": len(self.order_history),
+            "active_count": len(self.orders),
+        }

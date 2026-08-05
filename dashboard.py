@@ -27,6 +27,13 @@ from src.strategies.realtime_strategy import TradingSignal, SignalType
 from src.execution.brokers.simulated_broker import SimulatedBroker
 from src.execution.brokers.base_broker import Order, OrderDirection, OrderType
 from src.execution.risk_manager import RiskManager, OrderRequest, OrderSide
+from src.execution.a_share_rules import (
+    is_trading_day, can_trade_now, market_session,
+    get_lot_size, price_limits, estimate_total_cost,
+    stamp_duty, commission, validate_order_price,
+    is_etf, is_convertible_bond,
+)
+from src.data.info_channels import InfoChannelManager, init_default_channels, ChannelCategory
 from src.utils.trade_logger import TradeLogger
 from src.utils.config import Config
 from src.backtest.backtester import Backtester
@@ -49,133 +56,360 @@ st.set_page_config(
 
 _DARK_CSS = """
 <style>
-/* 深色主题覆盖 */
-.stApp {
-    background: #0A0A0B;
-    color: #E4E4E7;
-    font-family: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
+/* ═══════════════════════════════════════════════════════
+   Linear-Inspired Engineering Theme for AI Quant Trading
+   ═══════════════════════════════════════════════════════ */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+:root {
+  --bg-deep: #0a0e14;
+  --bg-base: #0d1117;
+  --bg-raised: #161b22;
+  --bg-overlay: #1a2029;
+  --border-subtle: rgba(255,255,255,0.06);
+  --border-default: rgba(255,255,255,0.08);
+  --border-strong: rgba(255,255,255,0.12);
+  --border-active: rgba(59,130,246,0.35);
+  --ink-primary: #e9edf4;
+  --ink-secondary: #8b95a8;
+  --ink-tertiary: #5b6679;
+  --ink-disabled: #3b4456;
+  --accent: #3b82f6;
+  --accent-soft: rgba(59,130,246,0.15);
+  --accent-glow: rgba(59,130,246,0.25);
+  --accent-brass: #d4a24e;
+  --accent-brass-soft: rgba(212,162,78,0.12);
+  --rise: #f43f5e;
+  --fall: #10b981;
+  --rise-soft: rgba(244,63,94,0.12);
+  --fall-soft: rgba(16,185,129,0.12);
+  --mono: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', monospace;
+  --sans: 'Inter', -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'PingFang SC', sans-serif;
 }
-/* 侧边栏 */
+
+/* ── base ── */
+.stApp {
+    background: var(--bg-base);
+    color: var(--ink-primary);
+    font-family: var(--sans);
+    font-feature-settings: "cv02","cv03","cv04","cv09";
+    -webkit-font-smoothing: antialiased;
+}
+
+/* ── dot-grid texture overlay ── */
+.stApp::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    opacity: 0.022;
+    background-image: radial-gradient(circle, rgba(255,255,255,0.7) 1px, transparent 1px);
+    background-size: 24px 24px;
+}
+
+/* ── gradient accents ── */
+.stApp::after {
+    content: "";
+    position: fixed;
+    top: -25%;
+    right: -12%;
+    width: 700px;
+    height: 500px;
+    pointer-events: none;
+    z-index: 0;
+    opacity: 0.05;
+    background: radial-gradient(ellipse, var(--accent) 0%, transparent 70%);
+}
+
+/* ── warm ambient glow ── */
+section[data-testid="stSidebar"] + div::before {
+    content: "";
+    position: fixed;
+    bottom: -20%;
+    left: -10%;
+    width: 500px;
+    height: 400px;
+    pointer-events: none;
+    z-index: 0;
+    opacity: 0.04;
+    background: radial-gradient(ellipse, rgba(212,162,78,0.6) 0%, transparent 70%);
+}
+
+/* ── sidebar ── */
 [data-testid="stSidebar"] {
-    background: #141417 !important;
-    border-right: 1px solid #27272A !important;
+    background: linear-gradient(180deg, var(--bg-deep), var(--bg-raised)) !important;
+    border-right: 1px solid var(--border-default) !important;
 }
 [data-testid="stSidebar"] .stMarkdown h1,
 [data-testid="stSidebar"] .stMarkdown h2,
 [data-testid="stSidebar"] .stMarkdown h3 {
-    color: #E4E4E7 !important;
+    color: var(--ink-primary) !important;
+    font-weight: 600 !important;
+    letter-spacing: -0.01em !important;
 }
 [data-testid="stSidebar"] [data-testid="stRadio"] label {
-    color: #A1A1AA !important;
+    color: var(--ink-tertiary) !important;
+    transition: color 0.15s ease !important;
 }
 [data-testid="stSidebar"] [data-testid="stRadio"] label:hover {
-    color: #E4E4E7 !important;
+    color: var(--ink-primary) !important;
 }
-/* 主标题 */
+
+/* ── headings ── */
 h1, h2, h3 {
-    color: #E4E4E7 !important;
+    color: var(--ink-primary) !important;
     font-weight: 600 !important;
+    letter-spacing: -0.015em !important;
 }
-/* 卡片容器 */
+
+/* ── KPI cards ── */
 .kpi-card {
-    background: #141417;
-    border: 1px solid #27272A;
-    border-radius: 12px;
+    background: linear-gradient(135deg, var(--bg-raised), var(--bg-overlay));
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
     padding: 16px 20px;
     margin-bottom: 12px;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+    position: relative;
+    overflow: hidden;
+}
+.kpi-card:hover {
+    border-color: var(--border-strong);
+}
+.kpi-card::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, var(--accent), transparent 80%);
+    opacity: 0.3;
 }
 .kpi-label {
-    font-size: 13px;
-    color: #71717A;
-    margin-bottom: 4px;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--ink-tertiary);
+    margin-bottom: 6px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
 }
 .kpi-value {
-    font-size: 24px;
-    font-weight: 700;
-    font-family: 'JetBrains Mono', monospace;
-    color: #E4E4E7;
+    font-size: 26px;
+    font-weight: 650;
+    font-family: var(--mono);
+    color: var(--ink-primary);
+    letter-spacing: -0.02em;
 }
 .kpi-delta-up {
-    color: #EF4444 !important;
+    color: var(--rise) !important;
 }
 .kpi-delta-down {
-    color: #22C55E !important;
+    color: var(--fall) !important;
 }
-/* 按钮 */
+
+/* ── buttons ── */
 .stButton > button {
-    background: #1C1C20 !important;
-    color: #E4E4E7 !important;
-    border: 1px solid #27272A !important;
+    background: var(--bg-raised) !important;
+    color: var(--ink-secondary) !important;
+    border: 1px solid var(--border-default) !important;
     border-radius: 8px !important;
+    font-family: var(--sans) !important;
+    font-weight: 500 !important;
+    font-size: 13px !important;
+    letter-spacing: -0.005em !important;
+    transition: all 0.15s ease !important;
+}
+.stButton > button:hover {
+    border-color: var(--border-strong) !important;
+    color: var(--ink-primary) !important;
+    background: var(--bg-overlay) !important;
 }
 .stButton > button[kind="primary"] {
-    background: #0EA5E9 !important;
-    color: #0A0A0B !important;
+    background: linear-gradient(135deg, var(--accent), #2563eb) !important;
+    color: #fff !important;
     border: none !important;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.2), 0 0 0 1px rgba(59,130,246,0.3) !important;
 }
-/* 输入框 */
+.stButton > button[kind="primary"]:hover {
+    background: linear-gradient(135deg, #4b90f5, #306df0) !important;
+    box-shadow: 0 2px 8px rgba(59,130,246,0.35), 0 0 0 1px rgba(59,130,246,0.45) !important;
+}
+.stButton > button[kind="secondary"] {
+    background: var(--bg-overlay) !important;
+    border-color: var(--border-strong) !important;
+}
+
+/* ── inputs ── */
 .stTextInput input,
 .stNumberInput input,
 .stSelectbox select,
 .stSlider {
-    background: #1C1C20 !important;
-    color: #E4E4E7 !important;
-    border: 1px solid #27272A !important;
+    background: var(--bg-deep) !important;
+    color: var(--ink-primary) !important;
+    border: 1px solid var(--border-default) !important;
     border-radius: 8px !important;
+    font-family: var(--mono) !important;
+    font-size: 13px !important;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease !important;
 }
-/* 表格 */
+.stTextInput input:focus,
+.stNumberInput input:focus {
+    border-color: var(--border-active) !important;
+    box-shadow: 0 0 0 3px var(--accent-soft) !important;
+}
+
+/* ── tables ── */
 [data-testid="stDataFrame"] table {
-    background: #141417 !important;
-    color: #E4E4E7 !important;
+    background: transparent !important;
+    color: var(--ink-primary) !important;
+    border-collapse: separate !important;
+    border-spacing: 0 !important;
 }
 [data-testid="stDataFrame"] th {
-    background: #1C1C20 !important;
-    color: #A1A1AA !important;
+    background: var(--bg-raised) !important;
+    color: var(--ink-tertiary) !important;
+    font-size: 10px !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.06em !important;
+    text-transform: uppercase !important;
+    border-bottom: 1px solid var(--border-default) !important;
+    padding: 10px 12px !important;
 }
 [data-testid="stDataFrame"] td {
-    border-bottom: 1px solid #27272A !important;
+    border-bottom: 1px solid var(--border-subtle) !important;
+    padding: 9px 12px !important;
+    font-size: 13px !important;
+    font-variant-numeric: tabular-nums !important;
 }
-/* 信息提示 */
+[data-testid="stDataFrame"] tbody tr:hover td {
+    background: rgba(255,255,255,0.02) !important;
+}
+
+/* ── alerts ── */
 .stInfo, .stSuccess, .stWarning, .stError {
-    background: #141417 !important;
-    border: 1px solid #27272A !important;
-    color: #E4E4E7 !important;
     border-radius: 8px !important;
+    font-size: 13px !important;
+    font-family: var(--sans) !important;
 }
-/* 折叠面板 */
+.stInfo {
+    background: rgba(59,130,246,0.08) !important;
+    border: 1px solid rgba(59,130,246,0.2) !important;
+    color: #93bbfd !important;
+}
+.stSuccess {
+    background: var(--fall-soft) !important;
+    border: 1px solid rgba(16,185,129,0.2) !important;
+    color: #6ee7b7 !important;
+}
+.stWarning {
+    background: rgba(245,158,11,0.08) !important;
+    border: 1px solid rgba(245,158,11,0.2) !important;
+    color: #fcd34d !important;
+}
+.stError {
+    background: var(--rise-soft) !important;
+    border: 1px solid rgba(244,63,94,0.2) !important;
+    color: #fda4af !important;
+}
+
+/* ── expanders ── */
 .streamlit-expanderHeader {
-    background: #141417 !important;
-    border: 1px solid #27272A !important;
+    background: var(--bg-raised) !important;
+    border: 1px solid var(--border-subtle) !important;
     border-radius: 8px !important;
-    color: #E4E4E7 !important;
+    color: var(--ink-secondary) !important;
+    font-size: 13px !important;
+    transition: border-color 0.15s ease !important;
 }
-/* 标签页 */
+.streamlit-expanderHeader:hover {
+    border-color: var(--border-default) !important;
+    color: var(--ink-primary) !important;
+}
+
+/* ── tabs ── */
 .stTabs [data-baseweb="tab-list"] {
-    background: #141417 !important;
+    background: var(--bg-raised) !important;
     border-radius: 8px !important;
+    border: 1px solid var(--border-subtle) !important;
+    padding: 4px !important;
+    gap: 2px !important;
 }
 .stTabs [data-baseweb="tab"] {
-    color: #A1A1AA !important;
+    color: var(--ink-tertiary) !important;
+    border-radius: 6px !important;
+    font-weight: 500 !important;
+    font-size: 13px !important;
+    padding: 6px 14px !important;
+    transition: all 0.15s ease !important;
+}
+.stTabs [data-baseweb="tab"]:hover {
+    color: var(--ink-secondary) !important;
+    background: rgba(255,255,255,0.03) !important;
 }
 .stTabs [data-baseweb="tab--selected"] {
-    color: #0EA5E9 !important;
-    border-bottom-color: #0EA5E9 !important;
+    color: var(--ink-primary) !important;
+    background: var(--bg-overlay) !important;
+    border-bottom: none !important;
+    box-shadow: 0 0 0 1px var(--border-default) !important;
 }
-/* metric */
+
+/* ── metrics ── */
 [data-testid="stMetric"] {
-    background: #141417 !important;
-    border: 1px solid #27272A !important;
-    border-radius: 12px !important;
-    padding: 12px 16px !important;
+    background: linear-gradient(135deg, var(--bg-raised), var(--bg-overlay)) !important;
+    border: 1px solid var(--border-subtle) !important;
+    border-radius: 10px !important;
+    padding: 14px 18px !important;
+    transition: border-color 0.2s ease !important;
+}
+[data-testid="stMetric"]:hover {
+    border-color: var(--border-strong) !important;
 }
 [data-testid="stMetric"] label {
-    color: #71717A !important;
+    color: var(--ink-tertiary) !important;
+    font-size: 11px !important;
+    font-weight: 500 !important;
+    letter-spacing: 0.03em !important;
 }
 [data-testid="stMetricValue"] {
-    color: #E4E4E7 !important;
-    font-family: 'JetBrains Mono', monospace !important;
-    font-weight: 700 !important;
+    color: var(--ink-primary) !important;
+    font-family: var(--mono) !important;
+    font-weight: 650 !important;
+    font-size: 22px !important;
+    letter-spacing: -0.02em !important;
 }
+
+/* ── checkbox / radio ── */
+[data-testid="stCheckbox"] label {
+    color: var(--ink-secondary) !important;
+    font-size: 13px !important;
+}
+
+/* ── selectbox dropdown ── */
+.stSelectbox [data-baseweb="popover"] {
+    background: var(--bg-raised) !important;
+    border: 1px solid var(--border-strong) !important;
+    border-radius: 8px !important;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.5) !important;
+}
+
+/* ── progress bars ── */
+.stProgress > div > div {
+    background: var(--bg-overlay) !important;
+    border-radius: 999px !important;
+}
+.stProgress > div > div > div {
+    background: linear-gradient(90deg, var(--accent), #60a5fa) !important;
+    border-radius: 999px !important;
+}
+
+/* ── scrollbar ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 999px; }
+::-webkit-scrollbar-thumb:hover { background: var(--ink-disabled); }
 </style>
 """
 st.markdown(_DARK_CSS, unsafe_allow_html=True)
@@ -208,6 +442,14 @@ def init_session_state():
         st.session_state.ai_decisions = {}
     if 'ai_graph_bundle' not in st.session_state:
         st.session_state.ai_graph_bundle = None
+    if 'channel_mgr' not in st.session_state:
+        st.session_state.channel_mgr = init_default_channels()
+    if 'last_refresh' not in st.session_state:
+        st.session_state.last_refresh = datetime.now()
+    if 'auto_refresh_enabled' not in st.session_state:
+        st.session_state.auto_refresh_enabled = False
+    if 'refresh_interval' not in st.session_state:
+        st.session_state.refresh_interval = 5
 
 
 
@@ -253,7 +495,7 @@ def action_label(action: str) -> str:
 
 
 def action_badge(action: str) -> str:
-    color = {"buy": "#dc2626", "sell": "#059669", "hold": "#475569"}.get(action, "#475569")
+    color = {"buy": "#f43f5e", "sell": "#10b981", "hold": "#546078"}.get(action, "#546078")
     return f"<span style='color:{color};font-weight:700'>{action_label(action)}</span>"
 
 
@@ -585,7 +827,7 @@ def render_ai_decision_detail(symbol: str, decision: dict):
         })
 
 
-def render_kpi_card(label, value, delta=None, delta_label=None, color="#E4E4E7"):
+def render_kpi_card(label, value, delta=None, delta_label=None, color="#e9edf4"):
     delta_html = ""
     if delta is not None:
         cls = "kpi-delta-up" if delta >= 0 else "kpi-delta-down"
@@ -604,13 +846,13 @@ def render_quote_card(symbol, q):
     name = q.get('name', symbol)
     price = float(q.get('price') or 0)
     change_pct = float(q.get('change_pct') or 0)
-    color = "#EF4444" if change_pct >= 0 else "#22C55E"
+    color = "#f43f5e" if change_pct >= 0 else "#10b981"
     arrow = "▲" if change_pct >= 0 else "▼"
     st.markdown(
         f"<div class='kpi-card' style='padding:12px 14px'>"
         f"<div style='display:flex;justify-content:space-between;align-items:center'>"
-        f"<span style='font-weight:600;color:#E4E4E7'>{name}</span>"
-        f"<span style='font-size:11px;color:#71717A'>{symbol}</span>"
+        f"<span style='font-weight:600;color:#e9edf4'>{name}</span>"
+        f"<span style='font-size:11px;color:#5b6679'>{symbol}</span>"
         f"</div>"
         f"<div style='display:flex;justify-content:space-between;align-items:baseline;margin-top:8px'>"
         f"<span style='font-size:20px;font-weight:700;font-family:JetBrains Mono,monospace;color:{color}'>{price:.2f}</span>"
@@ -633,6 +875,33 @@ def render_ai_cockpit():
     snap = portfolio_snapshot()
     risk_report = st.session_state.risk_manager.get_risk_report()
 
+    # ── 交易日历状态条 ──
+    session = market_session()
+    trading_today = is_trading_day()
+    can_trade, trade_msg = can_trade_now()
+    session_color = "#10b981" if session.is_open else ("#f59e0b" if session.code in ("pre_market", "auction") else "#f43f5e")
+    ch_mgr = st.session_state.channel_mgr
+    ch_health = ch_mgr.health_report()
+    avail_ch = sum(1 for c in ch_health.values() if c['available'])
+    total_ch = len(ch_health)
+
+    st.markdown(f"""
+    <div style="display:flex;flex-wrap:wrap;gap:16px;align-items:center;
+    padding:10px 16px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.06);
+    border-radius:10px;margin-bottom:16px;font-size:12px">
+      <span style="display:flex;align-items:center;gap:6px">
+        <span style="width:8px;height:8px;border-radius:50%;background:{session_color};display:inline-block"></span>
+        <span style="color:#e9edf4;font-weight:600">{session.label}</span>
+      </span>
+      <span style="color:#546078">|</span>
+      <span style="color:#8894a8">{'🟢 可交易' if can_trade else '🔴 ' + trade_msg}</span>
+      <span style="color:#546078">|</span>
+      <span style="color:#8894a8">📡 渠道: {avail_ch}/{total_ch} 可用</span>
+      <span style="color:#546078">|</span>
+      <span style="color:#8894a8">🔄 最后刷新: {st.session_state.last_refresh.strftime('%H:%M:%S')}</span>
+    </div>
+    """, unsafe_allow_html=True)
+
     total_asset = float(account.get('total_asset', 0) or 0)
     initial_capital = float(account.get('initial_capital', 1000000) or 1000000)
     total_pnl = total_asset - initial_capital
@@ -648,7 +917,7 @@ def render_ai_cockpit():
             format_money(total_pnl),
             delta=pnl_pct * 100,
             delta_label="%",
-            color="#EF4444" if total_pnl >= 0 else "#22C55E",
+            color="#f43f5e" if total_pnl >= 0 else "#10b981",
         )
     with kpi_cols[2]:
         win_rate = 0.0
@@ -660,7 +929,7 @@ def render_ai_cockpit():
         render_kpi_card("胜率", f"{win_rate:.1%}")
     with kpi_cols[3]:
         active_strategies = len(cfg.get('trading.symbols', []))
-        render_kpi_card("活跃策略", str(active_strategies), color="#0EA5E9")
+        render_kpi_card("活跃策略", str(active_strategies), color="#3b82f6")
 
     # 状态栏
     status_cols = st.columns(5)
@@ -763,13 +1032,13 @@ def render_ai_cockpit():
                     yaxis_title='价格',
                     hovermode='x unified',
                     height=500,
-                    paper_bgcolor='#0A0A0B',
-                    plot_bgcolor='#141417',
-                    font=dict(color='#E4E4E7'),
+                    paper_bgcolor='#0d1117',
+                    plot_bgcolor='rgba(255,255,255,0.015)',
+                    font=dict(color='#8b95a8'),
                     legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
                 )
-                fig.update_xaxes(rangeslider_visible=False, gridcolor='#27272A')
-                fig.update_yaxes(gridcolor='#27272A')
+                fig.update_xaxes(rangeslider_visible=False, gridcolor='rgba(255,255,255,0.06)')
+                fig.update_yaxes(gridcolor='rgba(255,255,255,0.06)')
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("暂无K线数据，请尝试其他股票代码")
@@ -855,23 +1124,50 @@ def render_ai_cockpit():
 
 init_session_state()
 
-st.sidebar.title("量化交易平台")
+# ── 侧边栏：增强版 ──
+st.sidebar.title("AI量化交易平台")
 st.sidebar.markdown("---")
 
-auto_refresh = st.sidebar.checkbox("自动刷新", value=False)
+# 交易日历状态
+session = market_session()
+trading_today = is_trading_day()
+session_color = "#10b981" if session.is_open else ("#f59e0b" if session.code in ("pre_market", "auction") else "#546078")
+st.sidebar.markdown(f"""
+<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;padding:8px 12px;
+background:rgba(255,255,255,.03);border-radius:8px;border:1px solid rgba(255,255,255,.06)">
+  <span style="width:8px;height:8px;border-radius:50%;background:{session_color};display:inline-block;flex:none"></span>
+  <div style="min-width:0">
+    <span style="font-size:12px;font-weight:600;color:#e9edf4">{session.label}</span>
+    <span style="font-size:10px;color:#546078;display:block">{'交易日' if trading_today else '非交易日'}</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+# 自动刷新
+auto_refresh = st.sidebar.checkbox("自动刷新", value=st.session_state.auto_refresh_enabled, key="auto_refresh_cb")
 if auto_refresh:
-    refresh_secs = st.sidebar.slider("刷新间隔(秒)", 2, 60, 5)
+    st.session_state.auto_refresh_enabled = True
+    refresh_secs = st.sidebar.slider("刷新间隔(秒)", 2, 60, st.session_state.refresh_interval)
+    st.session_state.refresh_interval = refresh_secs
     try:
         from streamlit_autorefresh import st_autorefresh
         st_autorefresh(interval=refresh_secs * 1000, key="auto-refresh")
     except ImportError:
-        st.sidebar.warning("未安装 streamlit-autorefresh, 实时刷新不可用")
+        pass
+else:
+    st.session_state.auto_refresh_enabled = False
+
+# 手动刷新按钮
+if st.sidebar.button("🔄 立即刷新", use_container_width=True):
+    st.session_state.last_refresh = datetime.now()
+    st.rerun()
 
 page = st.sidebar.radio(
     "导航",
     ["AI交易驾驶舱", "实时行情", "策略回测", "参数优化", "投资组合", "新闻情感", "风险监控", "系统状态"]
 )
 
+# 账户概览
 account_info = st.session_state.broker.get_account_info()
 st.sidebar.markdown("---")
 st.sidebar.subheader("账户概览")
@@ -879,6 +1175,10 @@ st.sidebar.metric("总资产", f"¥{account_info.get('total_asset', 0):,.2f}")
 st.sidebar.metric("可用资金", f"¥{account_info.get('cash', 0):,.2f}")
 st.sidebar.metric("盈亏", f"¥{account_info.get('profit', 0):,.2f}",
                    delta=f"{account_info.get('profit_pct', 0):.2f}%")
+
+# 最后刷新时间
+elapsed = (datetime.now() - st.session_state.last_refresh).total_seconds()
+st.sidebar.caption(f"上次刷新: {st.session_state.last_refresh.strftime('%H:%M:%S')} ({elapsed:.0f}秒前)")
 
 
 if page == "AI交易驾驶舱":
@@ -942,9 +1242,9 @@ elif page == "实时行情":
                         '昨收': '¥{:.2f}',
                         '今开': '¥{:.2f}',
                     }).map(
-                        lambda x: 'color: #EF4444; font-weight: 600'
+                        lambda x: 'color: #f43f5e; font-weight: 600'
                         if isinstance(x, (int, float)) and x > 0
-                        else ('color: #22C55E; font-weight: 600'
+                        else ('color: #10b981; font-weight: 600'
                               if isinstance(x, (int, float)) and x < 0 else ''),
                         subset=['涨跌幅(%)', '涨跌额']
                     ),
@@ -1002,13 +1302,13 @@ elif page == "实时行情":
                 yaxis_title='价格',
                 hovermode='x unified',
                 height=600,
-                paper_bgcolor='#0A0A0B',
-                plot_bgcolor='#141417',
-                font=dict(color='#E4E4E7'),
+                paper_bgcolor='#0b1018',
+                plot_bgcolor='rgba(255,255,255,0.015)',
+                font=dict(color='#8b95a8'),
                 legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
             )
-            fig.update_xaxes(rangeslider_visible=False, gridcolor='#27272A')
-            fig.update_yaxes(gridcolor='#27272A')
+            fig.update_xaxes(rangeslider_visible=False, gridcolor='rgba(255,255,255,0.06)')
+            fig.update_yaxes(gridcolor='rgba(255,255,255,0.06)')
             chart_placeholder.plotly_chart(fig, use_container_width=True)
         else:
             st.info("暂无K线数据，请尝试其他股票代码或检查网络连接")
@@ -1264,21 +1564,45 @@ elif page == "投资组合":
         st.info("当前无持仓")
 
     st.subheader("执行交易")
-    trade_symbol = st.text_input("股票代码", "sh600000")
-    trade_price = st.number_input("价格", 0.0, 1000.0, 10.0, step=0.01)
-    trade_quantity = st.number_input("数量(股)", 100, 1000000, 1000, step=100)
-
-    trade_col1, trade_col2 = st.columns(2)
+    trade_col1, trade_col2 = st.columns([1, 1])
     with trade_col1:
-        if st.button("买入", type="primary"):
+        trade_symbol = st.text_input("股票代码", "sh600000", key="trade_symbol_input")
+    with trade_col2:
+        trade_price = st.number_input("价格", 0.0, 10000.0, 10.0, step=0.01, key="trade_price_input")
+
+    # 显示交易规则提示
+    lot = get_lot_size(trade_symbol)
+    etf_tag = "ETF" if is_etf(trade_symbol) else ("可转债" if is_convertible_bond(trade_symbol) else "A股")
+
+    trade_col3, trade_col4 = st.columns([1, 1])
+    with trade_col3:
+        trade_quantity = st.number_input(f"数量({lot}股/手)", lot, 10000000, lot * 10, step=lot, key="trade_qty_input")
+    with trade_col4:
+        # 估算费用
+        if trade_price > 0 and trade_quantity > 0:
+            buy_cost = estimate_total_cost("buy", int(trade_quantity), float(trade_price))
+            sell_cost = estimate_total_cost("sell", int(trade_quantity), float(trade_price))
+            st.caption(f"买入预估: ¥{buy_cost:,.2f} | 卖出预估: ¥{sell_cost:,.2f} | 品种: {etf_tag}")
+        else:
+            st.caption(f"品种: {etf_tag} | 交易单位: {lot} | 最小变动: 0.01")
+
+    # 交易时段检查
+    can_trade, trade_msg = can_trade_now(trade_symbol)
+    if not can_trade:
+        st.warning(f"⚠️ {trade_msg}")
+
+    trade_col1, trade_col2, trade_col3 = st.columns([1, 1, 2])
+    with trade_col1:
+        buy_disabled = not can_trade
+        if st.button("买入", type="primary", disabled=buy_disabled, use_container_width=True):
             result = execute_guarded_order(
                 trade_symbol, 'buy', int(trade_quantity), float(trade_price),
                 reason='手动买入', source='portfolio_manual'
             )
             render_order_result(result)
-
     with trade_col2:
-        if st.button("卖出"):
+        sell_disabled = not can_trade
+        if st.button("卖出", disabled=sell_disabled, use_container_width=True):
             result = execute_guarded_order(
                 trade_symbol, 'sell', int(trade_quantity), float(trade_price),
                 reason='手动卖出', source='portfolio_manual'
@@ -1422,31 +1746,141 @@ elif page == "风险监控":
 elif page == "系统状态":
     st.title("系统状态")
 
+    # ── 交易日历 & 交易规则 ──
+    session = market_session()
+    trading_today = is_trading_day()
+    can_trade, trade_msg = can_trade_now()
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        color = "#10b981" if trading_today else "#f43f5e"
+        st.metric("交易日", "✅ 是" if trading_today else "❌ 否",
+                  delta="今日可交易" if trading_today else "休市")
+    with col2:
+        st.metric("当前时段", session.label,
+                  delta="可交易" if session.is_open else "不可交易")
+    with col3:
+        st.metric("交易状态", "🟢 开放" if can_trade else "🔴 关闭",
+                  delta=trade_msg if not can_trade else "正常")
+    with col4:
+        st.metric("A股规则", "T+1 / 涨跌停",
+                  delta="100股/手")
+
+    # ── 交易规则卡片 ──
+    st.subheader("A股交易规则")
+    rules_col1, rules_col2, rules_col3, rules_col4 = st.columns(4)
+    with rules_col1:
+        st.markdown("""
+        <div class="kpi-card">
+          <div class="kpi-label">T+1 制度</div>
+          <div style="font-size:15px;font-weight:600;color:#f59e0b">当日买入</div>
+          <div style="font-size:12px;color:#8894a8;margin-top:4px">下一交易日方可卖出</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with rules_col2:
+        st.markdown("""
+        <div class="kpi-card">
+          <div class="kpi-label">涨跌停限制</div>
+          <div style="font-size:15px;font-weight:600;color:#e9edf4">主板 ±10%</div>
+          <div style="font-size:12px;color:#8894a8;margin-top:4px">科创/创业 ±20% · 北交所 ±30%</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with rules_col3:
+        st.markdown("""
+        <div class="kpi-card">
+          <div class="kpi-label">交易费用</div>
+          <div style="font-size:15px;font-weight:600;color:#e9edf4">佣金 0.03%</div>
+          <div style="font-size:12px;color:#8894a8;margin-top:4px">最低5元 · 印花税(卖)0.05%</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with rules_col4:
+        st.markdown("""
+        <div class="kpi-card">
+          <div class="kpi-label">交易单位</div>
+          <div style="font-size:15px;font-weight:600;color:#e9edf4">100股/手</div>
+          <div style="font-size:12px;color:#8894a8;margin-top:4px">ETF 100份 · 可转债 10张</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── 账户信息 ──
     st.subheader("账户信息")
-    info_data = {
-        '总资产': f"¥{account_info.get('total_asset', 0):,.2f}",
-        '可用资金': f"¥{account_info.get('cash', 0):,.2f}",
-        '持仓市值': f"¥{account_info.get('market_value', 0):,.2f}",
-        '冻结资金': f"¥{account_info.get('frozen_cash', 0):,.2f}",
-        '总盈亏': f"¥{account_info.get('profit', 0):,.2f}",
-        '收益率': f"{account_info.get('profit_pct', 0):.2f}%"
-    }
-    st.json(info_data)
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("总资产", f"¥{account_info.get('total_asset', 0):,.2f}")
+    with col2:
+        st.metric("可用资金", f"¥{account_info.get('cash', 0):,.2f}")
+    with col3:
+        st.metric("持仓市值", f"¥{account_info.get('market_value', 0):,.2f}")
+    with col4:
+        st.metric("总盈亏", f"¥{account_info.get('profit', 0):,.2f}",
+                  delta=f"{account_info.get('profit_pct', 0):.2f}%")
 
+    # ── 风控状态 ──
     st.subheader("风控状态")
-    risk_info = {
-        '最大仓位比例': st.session_state.risk_manager.max_position_size,
-        '最大回撤限制': st.session_state.risk_manager.max_drawdown,
-        '止损比例': st.session_state.risk_manager.stop_loss,
-        '止盈比例': st.session_state.risk_manager.take_profit
-    }
-    st.json(risk_info)
+    rm = st.session_state.risk_manager
+    risk_report = rm.get_risk_report()
+    health = risk_report.get('health', {})
+    limits = risk_report.get('limits', {})
 
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        dd_val = risk_report.get('drawdown_pct', '0%')
+        dd_ok = health.get('drawdown_ok', True)
+        st.metric("回撤", dd_val, delta="✅ 安全" if dd_ok else "⚠️ 超标",
+                  delta_color="normal" if dd_ok else "inverse")
+    with col2:
+        dl_val = risk_report.get('daily_pnl_pct', '0%')
+        dl_ok = health.get('daily_loss_ok', True)
+        st.metric("日盈亏", dl_val, delta="✅ 正常" if dl_ok else "⚠️ 超限",
+                  delta_color="normal" if dl_ok else "inverse")
+    with col3:
+        st.metric("剩余容量", health.get('order_capacity_remaining', 0),
+                  delta="笔订单")
+    with col4:
+        blocked = health.get('blocked', False)
+        st.metric("锁定状态", "🔒 已锁定" if blocked else "🔓 正常",
+                  delta="风控已锁定" if blocked else "可交易")
+
+    # ── 信息渠道健康 ──
+    st.subheader("信息渠道健康")
+    channel_mgr = st.session_state.channel_mgr
+    ch_health = channel_mgr.health_report()
+    cat_summary = channel_mgr.category_summary()
+
+    # 渠道健康总览
+    total_ch = len(ch_health)
+    avail_ch = sum(1 for c in ch_health.values() if c['available'])
+    st.metric("渠道总览", f"{avail_ch}/{total_ch} 可用",
+              delta=f"{total_ch - avail_ch} 个不可用" if total_ch > avail_ch else "全部正常")
+
+    # 按分类展示
+    for cat in ChannelCategory:
+        info = cat_summary.get(cat.value, {})
+        if info.get('total', 0) == 0:
+            continue
+        avail = info.get('available', 0)
+        total = info.get('total', 0)
+        best = info.get('best', '—')
+        all_ch = info.get('all', [])
+
+        status_icon = "🟢" if avail == total else ("🟡" if avail > 0 else "🔴")
+        st.markdown(f"**{status_icon} {cat.value}** — {avail}/{total} 可用 (best: `{best}`)")
+
+        # 每个渠道的状态
+        ch_cols = st.columns(min(len(all_ch), 4))
+        for i, ch_name in enumerate(all_ch):
+            h = ch_health.get(ch_name, {})
+            icon = "🟢" if h.get('available') else "🔴"
+            with ch_cols[i % 4]:
+                st.caption(f"{icon} {ch_name} | SR:{h.get('success_rate', 1):.0%} | {h.get('avg_latency_ms', 0):.0f}ms")
+
+    st.divider()
+
+    # ── 交易日志 ──
     st.subheader("交易日志")
     log_files = [f for f in os.listdir(LOG_DIR) if os.path.isfile(os.path.join(LOG_DIR, f))] if os.path.exists(LOG_DIR) else []
     if log_files:
-        st.write("日志文件:")
         for f in log_files[-10:]:
-            st.text(f"  {f}")
+            st.text(f"📄 {f}")
     else:
         st.info("暂无日志文件")

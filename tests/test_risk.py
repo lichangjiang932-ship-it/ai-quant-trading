@@ -121,7 +121,8 @@ class TestRiskManager:
         report = rm.get_risk_report()
         assert "drawdown" in report
         assert "limits" in report
-        assert report["limits"]["stop_loss"] == 0.05
+        assert report["limits"]["stop_loss"] == "5.0%"
+        assert report["limits"]["take_profit"] == "10.0%"
 
 
 class TestTPSLMonitor:

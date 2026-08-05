@@ -245,20 +245,31 @@ class RiskManager:
             self._order_history = self._order_history[-1000:]
 
     def get_risk_report(self) -> Dict:
+        drawdown = (self.peak_equity - self.current_equity) / max(self.peak_equity, 1)
         return {
             "current_equity": self.current_equity,
             "peak_equity": self.peak_equity,
-            "drawdown": (self.peak_equity - self.current_equity) / max(self.peak_equity, 1),
+            "drawdown": drawdown,
+            "drawdown_pct": f"{drawdown:.2%}",
             "daily_pnl": self.daily_pnl,
+            "daily_pnl_pct": f"{self.daily_pnl / max(self.current_equity, 1):.2%}",
             "daily_order_count": self.daily_order_count,
             "blocked": self._blocked_until is not None and datetime.now() < self._blocked_until,
+            "blocked_until": self._blocked_until.isoformat() if self._blocked_until else None,
             "limits": {
-                "max_position_size": self.max_position_size,
-                "max_drawdown": self.max_drawdown,
-                "stop_loss": self.stop_loss,
-                "take_profit": self.take_profit,
-                "max_daily_loss": self.max_daily_loss,
-                "max_total_position": self.max_total_position,
+                "max_position_size": f"{self.max_position_size:.0%}",
+                "max_drawdown": f"{self.max_drawdown:.0%}",
+                "stop_loss": f"{self.stop_loss:.1%}",
+                "take_profit": f"{self.take_profit:.1%}",
+                "max_daily_loss": f"{self.max_daily_loss:.1%}",
+                "max_total_position": f"{self.max_total_position:.0%}",
+                "max_single_industry_pct": f"{self.max_single_industry_pct:.0%}",
                 "max_orders_per_day": self.max_orders_per_day,
+            },
+            "health": {
+                "drawdown_ok": drawdown <= self.max_drawdown,
+                "daily_loss_ok": abs(min(0, self.daily_pnl)) / max(self.current_equity, 1) <= self.max_daily_loss,
+                "order_capacity_remaining": self.max_orders_per_day - self.daily_order_count,
+                "blocked": self._blocked_until is not None and datetime.now() < self._blocked_until,
             },
         }

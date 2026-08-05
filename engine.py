@@ -13,6 +13,12 @@ from src.data.realtime.realtime_data import RealtimeData
 from src.execution.fast_broker import FastBroker, ExecOrder
 from src.execution.risk_manager import RiskManager, OrderRequest, OrderSide, RiskCheckResult
 from src.execution.tpsl_monitor import TPSLMonitor, TPSLConfig, TPSLReason, TPSLEvent
+from src.execution.a_share_rules import (
+    is_trading_day, can_trade_now, can_sell_today, market_session,
+    estimate_total_cost, price_limits, validate_order_price,
+    normalize_symbol as normalize_a_symbol, get_lot_size,
+)
+from src.data.info_channels import InfoChannelManager, init_default_channels, ChannelCategory
 from src.strategies.realtime_strategy import RealtimeStrategy, TradingSignal, SignalType
 from src.strategies.cross_ma_strategy import CrossMAStrategy
 from src.strategies.realtime_momentum_strategy import RealtimeMomentumStrategy
@@ -85,6 +91,22 @@ class TradingEngine:
         self._quote_count = 0
         self._signal_count = 0
         self._start_time: Optional[datetime] = None
+
+        # ── 信息渠道管理 ──
+        self.channel_mgr = init_default_channels()
+        self._channel_health: Dict = {}
+        self._trading_calendar: Dict = {}
+
+        # ── 交易规则摘要 ──
+        self._trading_rules = {
+            't_plus_1': True,
+            'stamp_duty_buy': 0.0,
+            'stamp_duty_sell': 0.0005,
+            'commission_rate': self.config.get('commission.rate', 0.0003),
+            'min_commission': self.config.get('commission.min', 5.0),
+            'board_lot': 100,
+            'price_tick': 0.01,
+        }
 
         self._latency_stats = {
             'quote_to_signal_ms': [],
@@ -429,8 +451,25 @@ class TradingEngine:
         price = signal.price
         reason = signal.reason
 
+        # ── A股交易规则检查 ──
+        can_trade, trade_msg = can_trade_now(symbol)
+        if not can_trade:
+            print(f"[A-RULES] {symbol} 交易被拒: {trade_msg}")
+            return
+
         if signal.signal_type == SignalType.BUY:
+            # 涨跌停检查
+            pre_close = self._last_quotes.get(symbol, {}).get('pre_close', 0)
+            name = self._last_quotes.get(symbol, {}).get('name', '')
+            price_err = validate_order_price(symbol, price, pre_close, name)
+            if price_err:
+                print(f"[A-RULES] {symbol} 价格校验失败: {price_err}")
+                return
+
             quantity = signal.quantity or self._calc_buy_qty(symbol, price)
+            # 买入数量必须是整手
+            lot = get_lot_size(symbol)
+            quantity = max(quantity // lot * lot, lot)
             account = self.broker.get_account_info()
             positions = self.broker.get_positions()
             current_symbol_value = 0.0
@@ -490,6 +529,28 @@ class TradingEngine:
                              f"买入失败 {symbol}", str(order_id), symbol=symbol)
 
         elif signal.signal_type == SignalType.SELL:
+            # T+1 卖出校验
+            positions = self.broker.get_positions()
+            position_info = None
+            for p in positions:
+                ps = p.get('symbol') if isinstance(p, dict) else getattr(p, 'symbol', '')
+                if ps == symbol:
+                    position_info = p
+                    break
+            if position_info:
+                buy_date_str = position_info.get('buy_date') if isinstance(position_info, dict) else getattr(position_info, 'buy_date', None)
+                if buy_date_str:
+                    try:
+                        buy_date = datetime.fromisoformat(str(buy_date_str).replace('Z', '+00:00'))
+                        if buy_date.tzinfo is not None:
+                            buy_date = buy_date.astimezone().replace(tzinfo=None)
+                        can_sell, sell_msg = can_sell_today(buy_date)
+                        if not can_sell:
+                            print(f"[A-RULES] {symbol} 卖出被拒(T+1): {sell_msg}")
+                            return
+                    except (ValueError, TypeError):
+                        pass
+
             success, order_id, order = self.broker.sell(
                 symbol, 0, price, reason
             )
@@ -522,8 +583,12 @@ class TradingEngine:
         account = self.broker.get_account_info()
         max_pos_pct = self.config.get('risk.max_position_size', 0.1)
         max_amount = account['total_asset'] * max_pos_pct
-        qty = int(max_amount / price / 100) * 100
-        return max(qty, 100)
+        # 预留手续费（佣金+印花税为0，买入不收印花税）
+        reserved = max_amount * self._trading_rules['commission_rate']
+        net_amount = max_amount - max(reserved, self._trading_rules['min_commission'])
+        lot = get_lot_size(symbol)
+        qty = int(net_amount / price / lot) * lot
+        return max(qty, lot)
 
     def _notify(self, ntype: NotificationType, level: NotificationLevel, title: str, message: str, **data):
         if self.notifier is None:
@@ -660,6 +725,17 @@ class TradingEngine:
             tpsl_stats = self.tpsl_monitor.get_stats()
             risk_report = self.risk_manager.get_risk_report()
 
+            # ── 更新渠道健康 ──
+            self._channel_health = self.channel_mgr.health_report()
+            # 更新交易日历
+            session = market_session()
+            self._trading_calendar = {
+                'is_trading_day': is_trading_day(),
+                'session': session.code,
+                'session_label': session.label,
+                'can_trade': session.is_open,
+            }
+
             self._feed_risk_to_agents(account, risk_report)
 
             print(f"\n[STATUS] {datetime.now().strftime('%H:%M:%S')}")
@@ -667,8 +743,9 @@ class TradingEngine:
             print(f"  盈亏: ¥{account['profit']:,.2f} ({account['profit_pct']:.2f}%)")
             print(f"  WS延迟: {ws_latency:.1f}ms | 信号->订单: {latency.get('signal_to_order', 0):.1f}ms")
             print(f"  行情: {self._quote_count}条 | 信号: {self._signal_count}个")
-            print(f"  风控: 回撤 {risk_report['drawdown']:.2%} | 日亏 ¥{risk_report['daily_pnl']:,.0f} | 今日单数 {risk_report['daily_order_count']}")
+            print(f"  风控: 回撤 {risk_report['drawdown_pct']} | 日亏 {risk_report['daily_pnl_pct']} | 今日单数 {risk_report['daily_order_count']}")
             print(f"  止盈止损: 监控 {tpsl_stats['active_positions']} 笔 | 累计触发 {tpsl_stats['total_triggered']} 次")
+            print(f"  交易时段: {self._trading_calendar['session_label']} | 渠道健康: {sum(1 for c in self._channel_health.values() if c['available'])}/{len(self._channel_health)} 可用")
 
     def get_latency_summary(self) -> Dict:
         summary = {}
@@ -759,10 +836,17 @@ class TradingEngine:
         print(f"  处理行情: {self._quote_count}条")
         print(f"  生成信号: {self._signal_count}个")
         print(f"  执行交易: {account['trade_count']}笔")
-        print(f"  总资产: ¥{account['total_asset']:,.2f} -> ¥{account['total_asset']:,.2f}")
+        print(f"  总资产: ¥{account['total_asset']:,.2f}")
         print(f"  盈亏: ¥{account['profit']:,.2f} ({account['profit_pct']:.2f}%)")
         print(f"  信号处理延迟: {latency.get('signal_to_order', 0):.1f}ms (平均)")
         print(f"  总流水线延迟: {latency.get('total_pipeline', 0):.1f}ms (平均)")
+        # 渠道统计
+        ch_summary = self.channel_mgr.category_summary()
+        ch_avail = sum(1 for c in self._channel_health.values() if c['available'])
+        print(f"  信息渠道: {ch_avail}/{len(self._channel_health)} 可用")
+        for cat, info in ch_summary.items():
+            if info['total'] > 0:
+                print(f"    {cat}: {info['available']}/{info['total']} (best: {info['best'] or 'none'})")
         print(f"{'='*50}")
 
         self.async_engine.stop()
