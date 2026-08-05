@@ -55,6 +55,7 @@ from .signal import (
     lockup_expiry,
     industry_comparison,
     market_overview_signal,
+    market_breadth,
 )
 from .fundamental import (
     margin_trading,
@@ -166,6 +167,10 @@ class AStockDataProvider:
     def market_overview(self, trade_date: Optional[str] = None) -> Dict:
         """市场全景快照"""
         return market_overview_signal(trade_date)
+
+    def market_breadth(self, trade_date: Optional[str] = None) -> Dict:
+        """市场宽度: 涨跌家数/涨停跌停/赚钱效应"""
+        return market_breadth(trade_date)
 
     # ── 资金面层 ──
 

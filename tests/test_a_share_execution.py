@@ -1,5 +1,7 @@
 from datetime import timedelta
 
+import pytest
+
 from src.execution.a_share_rules import (
     backtest_trade_rejection,
     buy_quantity_for_amount,
@@ -142,6 +144,36 @@ def test_paper_account_state_round_trip():
     assert restored.cash == broker.cash
     assert restored.get_positions()[0].quantity == 100
     assert restored.get_order_history().iloc[-1]["status"] == OrderStatus.FILLED.value
+
+
+def test_add_funds_preserves_positions_orders_and_profit():
+    broker = make_broker()
+    broker.place_order(
+        Order("sh600000", OrderDirection.BUY, 100, OrderType.LIMIT, price=10.0)
+    )
+    before = broker.get_account_info()
+    positions = broker.positions
+    order_history = broker.order_history
+    trade_history = broker.trade_history
+
+    after = broker.add_funds(25_000)
+
+    assert broker.positions is positions
+    assert broker.order_history is order_history
+    assert broker.trade_history is trade_history
+    assert broker.get_positions()[0].quantity == 100
+    assert len(broker.order_history) == 1
+    assert after["cash"] == pytest.approx(before["cash"] + 25_000)
+    assert after["initial_capital"] == pytest.approx(before["initial_capital"] + 25_000)
+    assert after["profit"] == pytest.approx(before["profit"])
+
+
+@pytest.mark.parametrize("amount", [0, -1, float("nan"), float("inf")])
+def test_add_funds_rejects_invalid_amount(amount):
+    broker = make_broker()
+
+    with pytest.raises(ValueError):
+        broker.add_funds(amount)
 
 
 def test_market_session_reports_known_state():

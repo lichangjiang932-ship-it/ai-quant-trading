@@ -85,3 +85,15 @@ def test_frontend_uses_sse_with_snapshot_fallback():
     assert "/api/snapshot?symbol=" in source
     assert "setInterval(refreshLight" not in source
     assert "visibilitychange" in source
+
+
+def test_frontend_separates_analyzed_candidates_from_recommendations():
+    html = api_server.FRONTEND_DIR + "/index.html"
+    with open(html, "r", encoding="utf-8") as file:
+        source = file.read()
+
+    assert "当前可执行推荐" in source
+    assert "已分析但未通过" in source
+    assert "本轮漏斗" in source
+    assert "费用后目标情景" in source
+    assert "scenarioQty" in source

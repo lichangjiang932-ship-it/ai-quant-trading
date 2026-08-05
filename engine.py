@@ -97,8 +97,8 @@ class TradingEngine:
         """按 config 的 broker.type 创建券商。
 
         simulated -> FastBroker(模拟,默认)
-        qmt       -> QMTFastAdapter(实盘);连接失败自动回退到 FastBroker,
-                     仿照旧版 main.py 的容错逻辑,保证引擎永不因券商缺失而崩溃。
+        qmt       -> QMTFastAdapter(迅投实盘);连接失败回退
+        guling    -> GulingFastAdapter(同花顺实盘, guling-trader);连接失败回退
         """
         initial_capital = self.config.get('trading.initial_capital', 1_000_000)
         commission_rate = self.config.get('commission.rate', 0.0003)
@@ -127,17 +127,45 @@ class TradingEngine:
                     min_commission=min_commission,
                 )
                 if adapter.connect():
-                    print("[Engine] 券商: QMT 实盘已连接")
+                    print("[Engine] Broker: QMT connected")
                     return adapter
-                print("[Engine] QMT 连接失败, 回退到模拟券商 FastBroker")
+                print("[Engine] QMT connect failed, fallback to FastBroker")
             except Exception as e:
-                print(f"[Engine] QMT 初始化异常, 回退到模拟券商: {e}")
+                print(f"[Engine] QMT init error, fallback: {e}")
+            return _make_fast()
+
+        if broker_type == 'guling':
+            try:
+                from src.execution.brokers.guling_broker import GulingFastAdapter
+                agent_token = self.config.get('broker.guling_agent_token', '')
+                mcp_url = self.config.get('broker.guling_mcp_url', 'https://mcp.guling.pro')
+                auto_trade = self.config.get('trading.auto_trade', False)
+
+                if not agent_token:
+                    print("[Engine] guling_agent_token not set, using FastBroker (sim)")
+                    return _make_fast()
+
+                adapter = GulingFastAdapter(
+                    agent_token=agent_token,
+                    mcp_url=mcp_url,
+                    initial_capital=initial_capital,
+                    commission_rate=commission_rate,
+                    stamp_tax_rate=stamp_tax_rate,
+                    min_commission=min_commission,
+                    auto_trade=auto_trade,
+                )
+                if adapter.connect():
+                    print("[Engine] Broker: THS (guling-trader) connected")
+                    return adapter
+                print("[Engine] guling-trader connect failed, fallback to FastBroker")
+            except Exception as e:
+                print(f"[Engine] guling-trader init error, fallback: {e}")
             return _make_fast()
 
         if broker_type not in ('simulated', 'sim', 'fast'):
-            print(f"[Engine] 未知券商类型 '{broker_type}', 使用模拟券商 FastBroker")
+            print(f"[Engine] Unknown broker type '{broker_type}', using FastBroker")
         else:
-            print("[Engine] 券商: 模拟盘 FastBroker")
+            print("[Engine] Broker: Simulated FastBroker")
         return _make_fast()
 
     def _build_agents_strategy(self, symbols):

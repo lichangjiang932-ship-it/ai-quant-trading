@@ -3,6 +3,7 @@
 """
 from typing import Dict, List, Optional
 from datetime import datetime
+import math
 import pandas as pd
 import uuid
 from .base_broker import BaseBroker, Order, Position, OrderDirection, OrderType, OrderStatus
@@ -61,6 +62,16 @@ class SimulatedBroker(BaseBroker):
     def disconnect(self):
         """断开连接"""
         self.connected = False
+
+    def add_funds(self, amount: float) -> Dict:
+        """Add cash without changing positions, orders, or investment profit."""
+        amount = float(amount)
+        if not math.isfinite(amount) or amount <= 0:
+            raise ValueError("添加资金金额必须大于 0")
+        self.cash += amount
+        # Deposits are contributed capital, not investment profit.
+        self.initial_capital += amount
+        return self.get_account_info()
     
     def get_account_info(self) -> Dict:
         """获取账户信息"""

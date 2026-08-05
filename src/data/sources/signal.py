@@ -365,20 +365,84 @@ def industry_comparison(top_n: int = 20) -> Dict:
 
 # ==================== 信号层组合用法 ====================
 
+def market_breadth(trade_date: Optional[str] = None) -> Dict:
+    """
+    市场宽度/涨跌分布统计 — 东财 getTopicZDFenBu。
+    返回: 涨/跌/平家数, 涨停/跌停家数, 分布表(按涨幅区间), 赚钱效应。
+    """
+    date_str = (trade_date or datetime.now().strftime("%Y%m%d")).replace("-", "")
+    url = "https://push2ex.eastmoney.com/getTopicZDFenBu"
+    params = {
+        "ut": "7eea3edcaed734bea9cbfc24409ed989",
+        "dpt": "wz.ztzt",
+        "Pageindex": 0,
+        "pagesize": 100,
+        "sort": "fbt:asc",
+        "date": date_str,
+    }
+    try:
+        r = requests.get(url, params=params, headers={"User-Agent": UA}, timeout=10)
+        data = r.json()
+        fb = data.get("data", {}).get("fenbu", [])
+        if not fb:
+            return {"available": False, "reason": "empty response"}
+
+        dist = {}
+        up = down = flat = limit_up = limit_down = 0
+        for item in fb:
+            for pct_str, cnt in item.items():
+                pct = int(pct_str)
+                cnt = int(cnt)
+                dist[pct] = cnt
+                if pct > 0:
+                    up += cnt
+                elif pct < 0:
+                    down += cnt
+                else:
+                    flat += cnt
+                if pct >= 10:
+                    limit_up += cnt
+                if pct <= -10:
+                    limit_down += cnt
+
+        total = up + down + flat
+        return {
+            "available": True,
+            "date": trade_date or datetime.now().strftime("%Y-%m-%d"),
+            "up": up, "down": down, "flat": flat,
+            "total": total,
+            "limit_up": limit_up, "limit_down": limit_down,
+            "up_ratio_pct": round(up / total * 100, 2) if total else 0,
+            "breadth": round((up - down) / max(total, 1) * 100, 2),
+            "distribution": dist,
+        }
+    except Exception as e:
+        return {"available": False, "reason": str(e)}
+
+
 def market_overview_signal(trade_date: Optional[str] = None) -> Dict:
     """
-    市场全景快照: 题材热度 + 北向流向 + 行业对比, 一站式信号摘要。
+    市场全景快照: 题材热度 + 北向流向 + 行业对比 + 涨跌家数, 一站式信号摘要。
     返回可序列化为 JSON 的 dict。
     """
     topics = ths_hot_topic_ranking(trade_date)
     north = northbound_today_summary()
     industry = industry_comparison(5)
     dt = daily_dragon_tiger(trade_date)
+    breadth = market_breadth(trade_date)
 
     return {
         "date": trade_date or datetime.now().strftime("%Y-%m-%d"),
         "hot_topics": [{"topic": t, "stock_count": n} for t, n in topics[:10]],
         "northbound": north,
+        "breadth": {
+            "up": breadth.get("up", 0), "down": breadth.get("down", 0),
+            "limit_up": breadth.get("limit_up", 0),
+            "limit_down": breadth.get("limit_down", 0),
+            "up_ratio_pct": breadth.get("up_ratio_pct", 0),
+            "breadth": breadth.get("breadth", 0),
+            "available": breadth.get("available", False),
+        },
         "top_industries": industry.get("top", [])[:5],
         "bottom_industries": industry.get("bottom", [])[-5:],
         "dragon_tiger_total": dt.get("total_records", 0),

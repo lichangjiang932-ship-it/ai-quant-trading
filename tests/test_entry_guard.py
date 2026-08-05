@@ -156,6 +156,30 @@ def test_entry_guard_replays_fee_adjusted_profit_from_recommendation_price():
     assert replay["net_return_pct"] < 1.0
 
 
+def test_fee_scenario_is_independent_from_zero_recommended_quantity():
+    guard = EntryGuard()
+    no_position_plan = {**plan(), "action": "hold", "suggested_qty": 0}
+
+    result = guard.evaluate(
+        "sh600000",
+        moderate_quote(),
+        no_position_plan,
+        validation(),
+        research=positive_research(guard),
+        reference_price=10.2,
+        market_open=True,
+    )
+
+    assert result["allowed"] is False
+    assert result["quantity"] == 0
+    assert result["scenario_quantity"] == 100
+    assert result["scenario_basis"] == "standard_lot"
+    assert result["target_scenario"]["quantity"] == 100
+    assert result["target_scenario"]["net_profit"] > 0
+    assert result["target_scenario"]["net_return_pct"] > 2
+    assert result["if_bought_at_analysis"]["available"] is False
+
+
 def test_prescreen_drops_chasing_candidate(monkeypatch):
     monkeypatch.setattr(
         api_server.realtime,
@@ -181,6 +205,47 @@ def test_prescreen_drops_chasing_candidate(monkeypatch):
     result = api_server._prescreen(candidates, top=5)
 
     assert [item["symbol"] for item in result] == ["sh600002"]
+
+
+def test_prescreen_can_fill_five_analysis_slots_without_bypassing_gate(monkeypatch):
+    symbols = [f"sh60000{i}" for i in range(1, 6)]
+    quotes = {
+        symbols[0]: {
+            "price": 10.2, "pre_close": 10, "open": 10.05,
+            "high": 10.3, "low": 9.95, "change_pct": 2,
+            "amount": 800_000_000,
+        }
+    }
+    for symbol in symbols[1:]:
+        quotes[symbol] = {
+            "price": 10.4, "pre_close": 10, "open": 10.8,
+            "high": 10.9, "low": 10.1, "change_pct": 4,
+            "amount": 800_000_000,
+        }
+    monkeypatch.setattr(api_server.realtime, "get_quotes", lambda *args, **kwargs: quotes)
+    candidates = [
+        {"symbol": symbol, "amount": 800_000_000, "candidate_source": "liquidity"}
+        for symbol in symbols
+    ]
+
+    result = api_server._prescreen(candidates, top=5, fill_shortfall=True)
+
+    assert len(result) == 5
+    assert result[0]["symbol"] == symbols[0]
+    assert result[0]["prescreen_passed"] is True
+    assert sum(bool(item["prescreen_fallback"]) for item in result) == 4
+    assert all(item["prescreen_passed"] is False for item in result[1:])
+    assert api_server._prescreen.last_stats["passed"] == 1
+    assert api_server._prescreen.last_stats["fallback"] == 4
+
+
+def test_empty_prescreen_clears_previous_statistics():
+    api_server._prescreen.last_stats = {"passed": 99}
+
+    assert api_server._prescreen([], top=5, fill_shortfall=True) == []
+    assert api_server._prescreen.last_stats == {
+        "passed": 0, "rejected": 0, "fallback": 0, "reasons": {},
+    }
 
 
 def test_pick_status_revokes_buy_when_price_has_weakened(monkeypatch):
@@ -241,6 +306,29 @@ def test_pick_status_revokes_buy_when_price_has_weakened(monkeypatch):
     assert payload["picks"][0]["action"] == "hold"
     assert payload["picks"][0]["entry_guard"]["allowed"] is False
     assert payload["profit_guaranteed"] is False
+
+
+def test_pick_status_marks_legacy_snapshot_without_starting_scan():
+    original = dict(api_server._scan_job)
+    api_server._scan_job.update({
+        "schema_version": 1,
+        "legacy_snapshot": True,
+        "status": "done",
+        "picks": [],
+        "started_at": "2026-07-01T09:00:00",
+        "finished_at": "2026-07-01T09:01:00",
+    })
+    try:
+        payload = response_json(api_server.ai_pick_status())
+    finally:
+        api_server._scan_job.clear()
+        api_server._scan_job.update(original)
+
+    assert payload["legacy_snapshot"] is True
+    assert payload["schema_version"] == 1
+    assert payload["current_schema_version"] == api_server._AI_PICK_SCHEMA_VERSION
+    assert "5 只深度分析" in payload["snapshot_notice"]
+    assert "旧版选股快照" in payload["disclaimer"]
 
 
 def test_pick_execute_cannot_bypass_live_chasing_guard(monkeypatch):

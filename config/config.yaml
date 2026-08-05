@@ -47,6 +47,12 @@ broker:
   account_id: ''
   mini_qmt_path: ''
   type: simulated
+  # === guling-trader (同花顺实盘) 配置 ===
+  # 使用前: 1) 下载 guling-trader.exe 运行并获取配对码
+  #         2) 用配对码换取 agent_token
+  #         3) 将 agent_token 填入下方
+  guling_agent_token: ''
+  guling_mcp_url: 'https://mcp.guling.pro'
 capital:
   block_trade: true
   dividend: true
@@ -163,7 +169,7 @@ strategy:
 trading:
   auto_trade: false
   enforce_market_hours: false
-  initial_capital: 100000
+  initial_capital: 1100000.0
   news_update_interval: 60
   slippage: 0.0001
   symbols:

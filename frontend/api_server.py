@@ -841,8 +841,12 @@ def _build_agent_ai_signals(symbols: List[str], quotes: Dict) -> List[Dict]:
 import threading as _threading
 from concurrent.futures import ThreadPoolExecutor as _Pool
 
+_AI_PICK_SCHEMA_VERSION = 2
+
 # 后台选股任务状态(单例; 同一时刻只跑一轮)
 _scan_job = {
+    "schema_version": _AI_PICK_SCHEMA_VERSION,
+    "legacy_snapshot": False,
     "status": "idle",      # idle | running | done | error
     "pool": "",            # market | watchlist
     "total": 0,            # 深度分析总数
@@ -850,6 +854,11 @@ _scan_job = {
     "current": "",         # 正在分析的股票名
     "picks": [],           # 结果(全部深度分析, 前端再按 action 分组)
     "candidates": 0,       # 粗筛前候选数
+    "requested": 5,        # 本轮计划深度分析数量
+    "prescreen_passed": 0,
+    "prescreen_fallback": 0,
+    "prescreen_rejected": 0,
+    "prescreen_reasons": {},
     "started_at": "",
     "finished_at": "",
     "error": "",
@@ -877,6 +886,15 @@ def _restore_scan_job():
         saved = state_manager.load_account_state('ai_pick_job', None)
         if not isinstance(saved, dict):
             return
+        try:
+            saved_version = int(saved.get('schema_version', 1) or 1)
+        except (TypeError, ValueError):
+            saved_version = 1
+        saved['schema_version'] = saved_version
+        saved['legacy_snapshot'] = bool(
+            saved.get('status') == 'done'
+            and saved_version < _AI_PICK_SCHEMA_VERSION
+        )
         if saved.get('status') == 'running':
             saved['status'] = 'error'
             saved['error'] = '上次选股因服务重启中断，请重新开始'
@@ -896,7 +914,9 @@ def _fetch_candidates(limit: int = 40) -> List[Dict]:
         from src.data.em_client import _cffi, _HAS_CFFI, UA
         url = "https://push2.eastmoney.com/api/qt/clist/get"
         headers = {"Referer": "https://quote.eastmoney.com/", "User-Agent": UA}
-        per_list = max(limit // 2, 10)
+        # 每个榜单都读取足够深，避免成交额榜前 20 恰好集中在同一热点板块时
+        # 第二个榜单又因重复而无法把候选池补足。
+        per_list = max(limit, 40)
         for ranking in ("f6", "f3"):
             params = {
                 "pn": 1, "pz": max(per_list * 3, 60), "po": 1,
@@ -956,13 +976,21 @@ def _fetch_candidates(limit: int = 40) -> List[Dict]:
     return out
 
 
-def _prescreen(candidates: List[Dict], top: int = 6) -> List[Dict]:
-    """规则粗筛: 用实时行情的量价指标给候选打分, 取头部(省 LLM 调用)。"""
+def _prescreen(
+    candidates: List[Dict],
+    top: int = 6,
+    fill_shortfall: bool = False,
+) -> List[Dict]:
+    """规则粗筛并记录淘汰原因；可用低风险近似项补足深度分析数量。"""
     syms = [c["symbol"] for c in candidates]
     if not syms:
+        _prescreen.last_stats = {
+            "passed": 0, "rejected": 0, "fallback": 0, "reasons": {},
+        }
         return []
     quotes = realtime.get_quotes(syms, sources=['tencent', 'sina', 'eastmoney']) or {}
-    scored = []
+    passed, rejected = [], []
+    rejection_counts: Dict[str, int] = {}
     for c in candidates:
         q = dict(c)
         for key, value in (quotes.get(c["symbol"], {}) or {}).items():
@@ -970,8 +998,7 @@ def _prescreen(candidates: List[Dict], top: int = 6) -> List[Dict]:
                 continue
             q[key] = value
         intraday = entry_guard.intraday_snapshot(q)
-        if not entry_guard.prescreen_allowed(q):
-            continue
+        prescreen_reasons = entry_guard.prescreen_reasons(q)
         change_pct = float(intraday.get('day_change_pct', 0) or 0)
         vol_ratio = float(q.get('vol_ratio', 0) or 0)
         turnover = float(q.get('turnover_pct', q.get('turnover', 0)) or 0)
@@ -988,9 +1015,33 @@ def _prescreen(candidates: List[Dict], top: int = 6) -> List[Dict]:
         c["score"] = round(score, 3)
         c["quote"] = q
         c["intraday"] = intraday
-        scored.append(c)
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    return scored[:top]
+        c["prescreen_passed"] = not prescreen_reasons
+        c["prescreen_reasons"] = prescreen_reasons
+        c["prescreen_fallback"] = False
+        if prescreen_reasons:
+            for reason in prescreen_reasons:
+                rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+            rejected.append(c)
+        else:
+            passed.append(c)
+
+    passed.sort(key=lambda item: item["score"], reverse=True)
+    # 补位只决定“是否值得继续分析”，不会绕过 _analyze_one 的实时硬门禁。
+    rejected.sort(key=lambda item: (len(item["prescreen_reasons"]), -item["score"]))
+    selected = passed[:top]
+    if fill_shortfall and len(selected) < top:
+        fallback = rejected[:top - len(selected)]
+        for item in fallback:
+            item["prescreen_fallback"] = True
+        selected.extend(fallback)
+
+    _prescreen.last_stats = {
+        "passed": len(passed),
+        "rejected": len(rejected),
+        "fallback": sum(1 for item in selected if item.get("prescreen_fallback")),
+        "reasons": rejection_counts,
+    }
+    return selected
 
 
 def _aggregate_news_sentiment(news_items) -> Optional[float]:
@@ -1230,20 +1281,16 @@ def _analyze_one(
             0.95,
         )
     primary_reasons = opportunity.get('reasons') or []
-    reason = "；".join(primary_reasons[:3]) or "多因子评分暂未达到买入标准"
-    if validation.get('samples', 0):
-        reason += (
-            f"；历史相似机会 {validation['samples']} 次，"
-            f"胜率 {validation['win_rate']:.1f}%"
-        )
-    if not data_quality.get('allowed'):
-        reason += "；行情质量门禁未通过"
-    elif not validation_ok:
-        reason += "；历史样本胜率或平均收益未通过审批"
-    if hard_veto:
-        reason += "；AI 风险复核给出高置信度否决"
-    if entry_evaluation.get('reasons'):
-        reason += "；" + "；".join(entry_evaluation['reasons'][:3])
+    if final_action == 'buy':
+        reason = "；".join(primary_reasons[:3]) or "综合审批通过，可按计划执行"
+        if validation.get('samples', 0):
+            reason += (
+                f"；历史相似机会 {validation['samples']} 次，"
+                f"胜率 {validation['win_rate']:.1f}%"
+            )
+    else:
+        # 未通过时先解释否决原因；有利因子另行展示，避免正面描述掩盖最终结论。
+        reason = "；".join(approval_failures[:4]) or "综合审批未形成可执行买入计划"
     target_scenario = entry_evaluation.get('target_scenario') or {}
     stop_scenario = entry_evaluation.get('stop_scenario') or {}
     return {
@@ -1254,6 +1301,7 @@ def _analyze_one(
         "action": final_action,
         "confidence": confidence,
         "reason": reason,
+        "positive_factors": primary_reasons[:4],
         "approval_label": approval_label if final_action != 'buy' else '综合审批通过',
         "approval_failures": approval_failures,
         "suggested_qty": suggested_qty,
@@ -1310,12 +1358,19 @@ def _run_scan(pool: str, top: int):
             syms = _get_watchlist()
             quotes = realtime.get_quotes(syms, sources=['tencent', 'sina', 'eastmoney']) or {}
             shortlist = [{"symbol": s, "name": quotes.get(s, {}).get('name', s),
-                          "quote": quotes.get(s, {})} for s in syms][:max(top, 6)]
+                          "quote": quotes.get(s, {}), "prescreen_passed": True,
+                          "prescreen_reasons": [], "prescreen_fallback": False}
+                         for s in syms][:top]
+            prescreen_stats = {
+                "passed": len(shortlist), "rejected": 0,
+                "fallback": 0, "reasons": {},
+            }
         else:
-            candidates = _fetch_candidates(limit=40)
+            candidates = _fetch_candidates(limit=max(80, top * 16))
             with _scan_lock:
                 _scan_job["candidates"] = len(candidates)
-            shortlist = _prescreen(candidates, top=top)
+            shortlist = _prescreen(candidates, top=top, fill_shortfall=True)
+            prescreen_stats = dict(getattr(_prescreen, 'last_stats', {}) or {})
 
         snap = _portfolio_snapshot()
         benchmark_symbol = _normalize_symbol(str(config.get('professional.benchmark_symbol', 'sh000001')))
@@ -1324,6 +1379,10 @@ def _run_scan(pool: str, top: int):
         with _scan_lock:
             _scan_job["total"] = len(shortlist)
             _scan_job["done"] = 0
+            _scan_job["prescreen_passed"] = int(prescreen_stats.get("passed", 0) or 0)
+            _scan_job["prescreen_fallback"] = int(prescreen_stats.get("fallback", 0) or 0)
+            _scan_job["prescreen_rejected"] = int(prescreen_stats.get("rejected", 0) or 0)
+            _scan_job["prescreen_reasons"] = dict(prescreen_stats.get("reasons", {}) or {})
         if not shortlist:
             with _scan_lock:
                 _scan_job["status"] = "done"
@@ -1342,6 +1401,11 @@ def _run_scan(pool: str, top: int):
                 [sym], sources=['tencent', 'sina', 'eastmoney']
             ).get(sym, {})
             res = _analyze_one(sym, q, snap, market_regime)
+            res["prescreen"] = {
+                "passed": bool(item.get("prescreen_passed", True)),
+                "fallback": bool(item.get("prescreen_fallback", False)),
+                "reasons": list(item.get("prescreen_reasons") or []),
+            }
             with _scan_lock:
                 _scan_job["done"] += 1
             picks[idx] = res
@@ -2100,17 +2164,22 @@ def _stream_snapshot(extra_symbols: Optional[List[str]] = None) -> Dict:
         quote_error = str(exc)
 
     # 行情先写入模拟券商，再计算资产、持仓和风控，避免快照出现一帧延迟。
-    info = broker.get_account_info()
-    snap = _portfolio_snapshot()
-    report = risk_mgr.get_risk_report()
-    report.update({
-        "total_asset": snap["total_asset"],
-        "cash": snap["cash"],
-        "market_value": snap["market_value"],
-        "total_position_pct": snap["total_position_pct"],
-        "cash_pct": snap["cash"] / max(snap["total_asset"], 1),
-        "position_count": len(snap["positions"]),
-    })
+    try:
+        info = broker.get_account_info()
+        snap = _portfolio_snapshot()
+        report = risk_mgr.get_risk_report()
+        report.update({
+            "total_asset": snap["total_asset"],
+            "cash": snap["cash"],
+            "market_value": snap["market_value"],
+            "total_position_pct": snap["total_position_pct"],
+            "cash_pct": snap["cash"] / max(snap["total_asset"], 1),
+            "position_count": len(snap["positions"]),
+        })
+    except Exception as exc:
+        info = {"total_asset": 0, "initial_capital": broker.initial_capital, "cash": 0, "profit": 0, "profit_pct": 0, "market_value": 0}
+        snap = {"positions": [], "total_asset": 0, "cash": 0, "market_value": 0, "total_position_pct": 0}
+        report = {"error": str(exc), "total_position_pct": 0, "drawdown": 0, "daily_order_count": 0}
     if quote_error:
         report['quote_error'] = quote_error
 
@@ -2219,8 +2288,17 @@ async def stream_updates(symbol: Optional[str] = Query(None)):
 async def get_dashboard_snapshot(symbol: Optional[str] = Query(None)):
     """SSE 不可用时的单请求快照，也供用户手动刷新使用。"""
     extras = [symbol] if symbol else []
-    payload = await asyncio.to_thread(_stream_snapshot, extras)
-    return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+    try:
+        payload = await asyncio.to_thread(_stream_snapshot, extras)
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            {"error": str(exc), "quotes": {}, "account": {}, "positions": [], "orders": [], "system": {}},
+            status_code=500,
+            headers={"Cache-Control": "no-store"},
+        )
 
 
 @app.get("/api/trade/approvals")
@@ -2282,19 +2360,14 @@ def update_trading_control(body: dict):
 @_locked_broker_operation
 def update_account(body: dict):
     """
-    更新账户设置（初始资金、佣金、印花税、滑点等）
-    重置券商状态，所有持仓和订单清零，按新参数重新初始化
+    更新佣金、印花税和滑点等账户参数，不改变资金、持仓或订单。
     """
     try:
-        initial_capital = float(body.get('initial_capital', broker.initial_capital))
         commission_rate = float(body.get('commission_rate', broker.commission_rate))
         stamp_tax_rate = float(body.get('stamp_tax_rate', broker.stamp_tax_rate))
         min_commission = float(body.get('min_commission', broker.min_commission))
-        slippage = float(body.get('slippage', 0.0001))
+        slippage = float(body.get('slippage', broker.slippage))
 
-        # 校验
-        if initial_capital < 10000:
-            return JSONResponse({"success": False, "error": "初始资金不能低于 10,000 元"})
         if not 0 <= commission_rate <= 0.05:
             return JSONResponse({"success": False, "error": "佣金费率必须在 0 到 5% 之间"})
         if not 0 <= stamp_tax_rate <= 0.05:
@@ -2304,42 +2377,30 @@ def update_account(body: dict):
         if not 0 <= slippage <= 0.10:
             return JSONResponse({"success": False, "error": "滑点必须在 0 到 10% 之间"})
 
-        # 重建 broker（重置所有持仓和订单）
-        broker.initial_capital = initial_capital
-        broker.cash = initial_capital
         broker.commission_rate = commission_rate
         broker.stamp_tax_rate = stamp_tax_rate
         broker.min_commission = min_commission
         broker.slippage = slippage
-        broker.positions = {}
-        broker.orders = []
-        broker.order_history = []
-        broker.trade_history = []
-        broker._session_date = datetime.now().date()
-        risk_mgr.daily_pnl = 0.0
-        risk_mgr.daily_order_count = 0
-        risk_mgr.peak_equity = initial_capital
 
         # 同步写入 config.yaml（持久化）
-        config.set('trading.initial_capital', int(initial_capital))
         config.set('commission.rate', commission_rate)
         config.set('commission.min', int(min_commission))
         config.set('commission.stamp_tax', stamp_tax_rate)
         config.set('trading.slippage', slippage)
         config.save_config(CONFIG_PATH)
         _persist_broker_state()
-        _persist_risk_runtime()
 
         info = broker.get_account_info()
         return JSONResponse({
             "success": True,
+            "message": "账户参数已保存，持仓和订单未受影响",
             "account": {
                 "total_asset": float(info.get('total_asset', 0) or 0),
-                "initial_capital": float(info.get('initial_capital', initial_capital)),
+                "initial_capital": float(info.get('initial_capital', broker.initial_capital)),
                 "cash": float(info.get('cash', 0) or 0),
-                "profit": 0.0,
-                "profit_pct": 0.0,
-                "positions": 0,
+                "profit": float(info.get('profit', 0) or 0),
+                "profit_pct": float(info.get('profit_pct', 0) or 0),
+                "positions": len(broker.get_positions()),
                 "commission_rate": commission_rate,
                 "commission_rate_wan": round(commission_rate * 10000, 1),
                 "stamp_tax_rate": stamp_tax_rate,
@@ -2347,11 +2408,49 @@ def update_account(body: dict):
                 "min_commission": min_commission,
                 "slippage": slippage,
                 "slippage_wan": round(slippage * 10000, 1),
-                "market_value": 0.0,
+                "market_value": float(info.get('market_value', 0) or 0),
             }
         })
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)})
+
+
+@app.post("/api/account/deposit")
+@_locked_broker_operation
+def deposit_account(body: dict):
+    """向模拟账户添加资金，同时完整保留现有持仓、订单和交易记录。"""
+    try:
+        amount = float(body.get('amount', 0))
+        info = broker.add_funds(amount)
+
+        # 同步抬高资金基准和回撤高水位，避免把入金误计为盈利。
+        risk_mgr.peak_equity = max(
+            float(risk_mgr.peak_equity) + amount,
+            float(info.get('total_asset', 0) or 0),
+        )
+        config.set('trading.initial_capital', broker.initial_capital)
+        config.save_config(CONFIG_PATH)
+        _persist_broker_state()
+        _persist_risk_runtime()
+
+        return JSONResponse({
+            "success": True,
+            "message": f"已添加资金 {amount:,.2f} 元，持仓和订单未受影响",
+            "amount": amount,
+            "account": {
+                "total_asset": float(info.get('total_asset', 0) or 0),
+                "initial_capital": float(info.get('initial_capital', broker.initial_capital)),
+                "cash": float(info.get('cash', 0) or 0),
+                "profit": float(info.get('profit', 0) or 0),
+                "profit_pct": float(info.get('profit_pct', 0) or 0),
+                "positions": len(broker.get_positions()),
+                "market_value": float(info.get('market_value', 0) or 0),
+            },
+        })
+    except (TypeError, ValueError) as exc:
+        return JSONResponse({"success": False, "error": str(exc)})
+    except Exception as exc:
+        return JSONResponse({"success": False, "error": f"添加资金失败: {exc}"})
 
 
 def _strategy_universe(watchlist: List[str], held_symbols: List[str], limit: int = 12) -> List[str]:
@@ -2924,8 +3023,12 @@ def ai_pick_start(body: dict = None):
                                  "message": "已有一轮选股在进行中",
                                  "done": _scan_job["done"], "total": _scan_job["total"]})
         _scan_job.update({
+            "schema_version": _AI_PICK_SCHEMA_VERSION,
+            "legacy_snapshot": False,
             "status": "running", "pool": pool, "total": 0, "done": 0,
             "current": "", "picks": [], "candidates": 0,
+            "requested": top, "prescreen_passed": 0, "prescreen_fallback": 0,
+            "prescreen_rejected": 0, "prescreen_reasons": {},
             "started_at": datetime.now().isoformat(), "finished_at": "", "error": "",
         })
 
@@ -3006,13 +3109,39 @@ def ai_pick_status():
             _scan_live_cache["expire"] = time.time() + _live_ttl
             _scan_live_cache["picks"] = [dict(item) for item in picks]
     buys = [item for item in picks if item.get("action") == "buy"]
+    try:
+        snapshot_version = int(job.get("schema_version", 1) or 1)
+    except (TypeError, ValueError):
+        snapshot_version = 1
+    legacy_snapshot = bool(
+        job.get("status") == "done"
+        and (
+            job.get("legacy_snapshot")
+            or snapshot_version < _AI_PICK_SCHEMA_VERSION
+        )
+    )
     return JSONResponse({
+        "schema_version": snapshot_version,
+        "current_schema_version": _AI_PICK_SCHEMA_VERSION,
+        "legacy_snapshot": legacy_snapshot,
+        "snapshot_notice": (
+            "这是升级前保存的选股结果，可能只分析了 1 只股票；"
+            "点击“开始AI选股”后，新一轮会从扩展候选池中完成 5 只深度分析。"
+            if legacy_snapshot else ""
+        ),
         "status": job["status"],
         "pool": job["pool"],
         "total": job["total"],
         "done": job["done"],
         "current": job["current"],
         "candidates": job["candidates"],
+        "requested": int(job.get("requested", 5) or 5),
+        "analyzed_count": len(picks),
+        "recommended_count": len(buys),
+        "prescreen_passed": int(job.get("prescreen_passed", 0) or 0),
+        "prescreen_fallback": int(job.get("prescreen_fallback", 0) or 0),
+        "prescreen_rejected": int(job.get("prescreen_rejected", 0) or 0),
+        "prescreen_reasons": dict(job.get("prescreen_reasons", {}) or {}),
         "candidate_error": getattr(_fetch_candidates, 'last_error', '') or '',
         "picks": picks,
         "buy_count": len(buys),
@@ -3020,7 +3149,12 @@ def ai_pick_status():
         "finished_at": job["finished_at"],
         "error": job["error"],
         "profit_guaranteed": False,
-        "disclaimer": "AI 选股不能确保盈利；页面会按最新价复核，并展示若在推荐价买入后的费用后净盈亏。",
+        "disclaimer": (
+            "【旧版选股快照】当前是升级前保存的单股分析；点击“开始AI选股”后，"
+            "新一轮会从扩展候选池中完成 5 只深度分析。AI 选股不能确保盈利。"
+            if legacy_snapshot else
+            "AI 选股不能确保盈利；页面会按最新价复核，并展示若在推荐价买入后的费用后净盈亏。"
+        ),
     })
 
 

@@ -245,6 +245,105 @@ class NewsFetcher:
         except Exception as e:
             print(f"获取同花顺新闻失败: {e}")
         return news_list
+
+    def fetch_wallstreetcn_news(self, count: int = 20) -> List[NewsItem]:
+        """获取华尔街见闻 7x24 快讯"""
+        news_list = []
+        try:
+            url = "https://api-one.wallstcn.com/apiv1/content/lives"
+            params = {'channel': 'global-channel', 'limit': count}
+
+            response = requests.get(url, params=params, headers=self.headers, timeout=10)
+            data = response.json()
+
+            items = data.get('data', {}).get('items', [])
+            for item in items:
+                content = item.get('content_text', '') or ''
+                content = re.sub(r'<[^>]+>', '', content)
+                title = item.get('title', '') or (content[:50] + '...' if len(content) > 50 else content)
+                symbols = self._extract_symbols_from_text(content)
+
+                news = NewsItem(
+                    title=title,
+                    content=content[:500],
+                    source='华尔街见闻',
+                    url=item.get('uri', '') or f"https://wallstreetcn.com/livenews/{item.get('id', '')}",
+                    publish_time=datetime.fromtimestamp(int(item['display_time'])) if item.get('display_time') else None,
+                    symbols=symbols,
+                    category='财经快讯',
+                    importance=max(self._calc_importance(title, 'wscn'), 5)
+                )
+                news_list.append(news)
+        except Exception as e:
+            print(f"获取华尔街见闻新闻失败: {e}")
+        return news_list
+
+    def fetch_yicai_news(self, count: int = 20) -> List[NewsItem]:
+        """获取第一财经新闻"""
+        news_list = []
+        try:
+            url = "https://www.yicai.com/api/ajax/getlatest"
+            params = {'page': 1, 'pagesize': count}
+
+            response = requests.get(url, params=params, headers=self.headers, timeout=10)
+            data = response.json()
+
+            if isinstance(data, list):
+                for item in data:
+                    title = item.get('NewsTitle', '')
+                    content = item.get('NewsNotes', '') or item.get('NewsSummary', '') or ''
+                    content = re.sub(r'<[^>]+>', '', content)
+                    symbols = self._extract_symbols_from_text(title + content)
+
+                    news = NewsItem(
+                        title=title,
+                        content=content[:500],
+                        source='第一财经',
+                        url=item.get('NewsUrl', '') or item.get('url', ''),
+                        publish_time=self._parse_time(item.get('CreateDate', '') or item.get('pubDate', '')),
+                        symbols=symbols,
+                        category='财经新闻',
+                        importance=self._calc_importance(title, 'yicai')
+                    )
+                    news_list.append(news)
+        except Exception as e:
+            print(f"获取第一财经新闻失败: {e}")
+        return news_list
+
+    def fetch_sina_live_news(self, count: int = 20) -> List[NewsItem]:
+        """获取新浪财经 7x24 全球直播快讯 (JSON 接口, 比滚动新闻更新更及时)"""
+        news_list = []
+        try:
+            url = "https://zhibo.sina.com.cn/api/zhibo/feed"
+            params = {
+                'page': 1, 'page_size': count, 'zhibo_id': 152,
+                'tag_id': 0, 'dire': 'f', 'dpc': 1,
+            }
+
+            response = requests.get(url, params=params, headers=self.headers, timeout=10)
+            data = response.json()
+
+            items = data.get('result', {}).get('data', {}).get('feed', {}).get('list', [])
+            for item in items:
+                content = item.get('rich_text', '') or ''
+                content = re.sub(r'<[^>]+>', '', content)
+                title = content[:50] + '...' if len(content) > 50 else content
+                symbols = self._extract_symbols_from_text(content)
+
+                news = NewsItem(
+                    title=title,
+                    content=content[:500],
+                    source='新浪财经直播',
+                    url=f"https://zhibo.sina.com.cn/live/152/1",
+                    publish_time=self._parse_time(item.get('create_time', '')),
+                    symbols=symbols,
+                    category='财经快讯',
+                    importance=max(self._calc_importance(title, 'sina'), 5)
+                )
+                news_list.append(news)
+        except Exception as e:
+            print(f"获取新浪直播新闻失败: {e}")
+        return news_list
     
     # ==================== 专业数据源 ====================
     
@@ -487,9 +586,11 @@ class NewsFetcher:
         # 来源权重
         source_weights = {
             'cls': 2, '财联社': 2,
+            'wscn': 2, '华尔街见闻': 2,
             'eastmoney': 1, '东方财富': 1,
-            'sina': 1, '新浪财经': 1,
-            'ths': 1, '同花顺': 1
+            'sina': 1, '新浪财经': 1, '新浪财经直播': 1,
+            'ths': 1, '同花顺': 1,
+            'yicai': 1, '第一财经': 1,
         }
         importance += source_weights.get(source, 0)
         
@@ -505,13 +606,16 @@ class NewsFetcher:
     # ==================== 聚合方法 ====================
     
     def fetch_all_news(self) -> List[NewsItem]:
-        """获取所有新闻源"""
+        """获取所有新闻源 (7 个渠道聚合)"""
         all_news = []
         
         all_news.extend(self.fetch_sina_finance_news(20))
+        all_news.extend(self.fetch_sina_live_news(20))
         all_news.extend(self.fetch_eastmoney_news(20))
         all_news.extend(self.fetch_cls_news(20))
         all_news.extend(self.fetch_ths_news(20))
+        all_news.extend(self.fetch_wallstreetcn_news(20))
+        all_news.extend(self.fetch_yicai_news(20))
         
         # 去重
         seen = set()

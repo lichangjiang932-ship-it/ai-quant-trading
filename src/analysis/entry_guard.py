@@ -84,14 +84,23 @@ class EntryGuard:
             "quote_source": str(quote.get("data_source") or ""),
         }
 
-    def prescreen_allowed(self, quote: Optional[Dict]) -> bool:
+    def prescreen_reasons(self, quote: Optional[Dict]) -> List[str]:
         snapshot = self.intraday_snapshot(quote)
-        return bool(
-            snapshot["complete"]
-            and self.config.min_day_change_pct <= snapshot["day_change_pct"] <= self.config.max_day_gain_pct
-            and snapshot["open_gap_pct"] <= self.config.max_open_gap_pct
-            and not snapshot["fading"]
-        )
+        reasons = []
+        if not snapshot["complete"]:
+            reasons.append("行情字段不完整")
+        if snapshot["day_change_pct"] > self.config.max_day_gain_pct:
+            reasons.append("涨幅过大")
+        elif snapshot["day_change_pct"] < self.config.min_day_change_pct:
+            reasons.append("尚未止跌")
+        if snapshot["open_gap_pct"] > self.config.max_open_gap_pct:
+            reasons.append("高开超限")
+        if snapshot["fading"]:
+            reasons.append("冲高回落")
+        return reasons
+
+    def prescreen_allowed(self, quote: Optional[Dict]) -> bool:
+        return not self.prescreen_reasons(quote)
 
     def build_research_snapshot(
         self,
@@ -310,6 +319,9 @@ class EntryGuard:
         price = float(intraday["price"] or 0)
         reference = float(reference_price or price or 0)
         quantity = max(int(opportunity.get("suggested_qty", 0) or 0), 0)
+        # 收益空间必须独立于最终仓位决策。没有建议数量时仍按 A 股标准一手
+        # 计算费用情景，避免“数量为 0 -> 收益率恒为 0”的循环结论。
+        scenario_quantity = quantity if quantity > 0 else 100
         buy_low = self._number(opportunity.get("buy_low"))
         buy_high = self._number(opportunity.get("buy_high"))
         stop_loss = self._number(opportunity.get("stop_loss"))
@@ -318,16 +330,18 @@ class EntryGuard:
         signal_age = self._signal_age_seconds(generated_at)
         live_price_available = price > 0
         target_profit = (
-            self._sell_proceeds(quantity, target_price) - self._buy_cost(quantity, price)
+            self._sell_proceeds(scenario_quantity, target_price)
+            - self._buy_cost(scenario_quantity, price)
             if live_price_available else 0.0
         )
         stop_loss_amount = (
-            self._buy_cost(quantity, price) - self._sell_proceeds(quantity, stop_loss)
+            self._buy_cost(scenario_quantity, price)
+            - self._sell_proceeds(scenario_quantity, stop_loss)
             if live_price_available else 0.0
         )
-        invested = self._buy_cost(quantity, price) if live_price_available else 0.0
+        invested = self._buy_cost(scenario_quantity, price) if live_price_available else 0.0
         target_net_return_pct = target_profit / invested * 100 if invested > 0 else 0.0
-        break_even_price = self._break_even_price(quantity, price)
+        break_even_price = self._break_even_price(scenario_quantity, price)
         retrospective_available = live_price_available and reference > 0 and quantity > 0
         retrospective_pnl = (
             self._sell_proceeds(quantity, price) - self._buy_cost(quantity, reference)
@@ -455,16 +469,21 @@ class EntryGuard:
             "price_drift_pct": round(price_drift_pct, 4),
             "signal_age_seconds": round(signal_age, 1) if signal_age is not None else None,
             "quantity": quantity,
+            "scenario_quantity": scenario_quantity,
+            "scenario_basis": "planned" if quantity > 0 else "standard_lot",
             "buy_low": round(buy_low, 4),
             "buy_high": round(buy_high, 4),
             "break_even_price": round(break_even_price, 4),
             "target_scenario": {
                 "price": round(target_price, 4),
+                "quantity": scenario_quantity,
+                "basis": "planned" if quantity > 0 else "standard_lot",
                 "net_profit": round(target_profit, 2),
                 "net_return_pct": round(target_net_return_pct, 4),
             },
             "stop_scenario": {
                 "price": round(stop_loss, 4),
+                "quantity": scenario_quantity,
                 "net_loss": round(max(stop_loss_amount, 0), 2),
             },
             "if_bought_at_analysis": {

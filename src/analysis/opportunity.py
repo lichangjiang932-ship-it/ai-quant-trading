@@ -207,7 +207,7 @@ class OpportunityScorer:
         if trend_score >= 18:
             reasons.append("中期趋势向上，20 日均线强于 60 日均线")
         if 0.20 <= price_percentile <= 0.60:
-            reasons.append("价格位于近 120 日区间中低部，向上空间相对更充足")
+            reasons.append("价格位于近 120 日区间中低部，仅表示价格位置因子相对有利")
         if 0.02 <= ret20 <= 0.15:
             reasons.append("20 日动量温和转强，暂未出现明显追高")
         if 1.0 <= volume_ratio <= 2.5:

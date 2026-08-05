@@ -1,0 +1,190 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12",
+  "version": "1.0.0",
+  "tools": [
+    {
+      "name": "balance",
+      "description": "查询资金账户余额。data 为 number 字段：资金余额/冻结金额/可用金额/可取金额/股票市值/总资产/持仓盈亏/当日盈亏（单位元），当日盈亏比_pct（百分比数值）。缺值为 null（不是 0）。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "position",
+      "description": "查询当前股票持仓。每行：证券代码, 证券名称, 股票余额, 可用余额, 冻结数量(股), 参考成本价, 市价(元), market_value, 浮动盈亏(元), 盈亏比例_pct。缺值为 null。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "orders_active",
+      "description": "查询**在飞**委托单（未报/已报/部成）。已成/已撤/废单不出现在本表（契约 v2 C3）；状态识别不出的行按在飞保守返回。每行：client_order_id, entrust_no, 证券代码, 证券名称, 方向, 委托价, 委托数量, 已成数量, 成交均价, 状态, 柜台备注。数值为 number，缺值为 null（不是 0）。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "orders_filled",
+      "description": "查询当日成交明细。每行：client_order_id, entrust_no, 成交编号, 成交时间(ISO8601，日期与时区来自受控端本机时钟，非柜台时间), 证券代码, 证券名称, 方向, 成交数量, 成交均价, 成交金额。数值为 number，缺值为 null。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "settlement",
+      "description": "查询交割单（历史成交结算记录，含更完整的日期、代码、名称、操作、数量、均价、金额、发生金额、手续费、印花税等）。数据量可能较大，适合偶尔做整体盈亏/交易复盘分析。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "date_range": {
+            "type": "string",
+            "description": "查询的时间跨度，可选值：近一周、近一月、近三月、近一年；默认近一年",
+            "enum": [
+              "近一周",
+              "近一月",
+              "近三月",
+              "近一年"
+            ],
+            "default": "近一年"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "watchlist",
+      "description": "查询自选股列表（证券代码）。返回同花顺自选股当前顶部可见的代码列表；按同花顺习惯，最新加入的自选股出现在顶部。注意：受限于客户端渲染，仅返回第一屏顶部部分（非全量，返回中 partial=true）。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "buy",
+      "description": "下买入委托单。**会真实下单**，慎重调用。不传 price=五档即成剩撤市价单(立即成交、剩余自动撤销、无残留挂单)，回执 status/filled_amount/avg_price 为实际成交；传 price=限价挂单，返回 entrust_no，未成交需自行用 orders_active+cancel 管理。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "stock_no": {
+            "type": "string",
+            "description": "6位数字股票代码，如 600000"
+          },
+          "amount": {
+            "type": "integer",
+            "description": "买入股数（必须为 100 股的整数倍）"
+          },
+          "price": {
+            "type": "number",
+            "description": "限价买入价格。不传则走同花顺市价委托(五档即成剩撤)立即成交、剩余自动撤销、无残留挂单；传则限价挂单，需自行 orders_active/cancel 管理。"
+          },
+          "client_order_id": {
+            "type": "string",
+            "description": "客户端订单 ID，**幂等键**：同一 id 重复提交只会下单一次，重发返回首次回执（首次结果未知时返回 unknown_outcome，仍不会产生第二次提交）。超时后的安全动作就是用同一 id 原样重发。该 id 不写入柜台，仅存于受控端台账，orders_active/orders_filled 尽力回显（回查不到合同编号的单与外部单为 null）。建议全局唯一并含账户维度。"
+          }
+        },
+        "required": [
+          "stock_no",
+          "amount"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "sell",
+      "description": "下卖出委托单。**会真实下单**，慎重调用。不传 price=五档即成剩撤市价单(立即成交、剩余自动撤销、无残留挂单)，回执 status/filled_amount/avg_price 为实际成交；传 price=限价挂单，返回 entrust_no，未成交需自行用 orders_active+cancel 管理。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "stock_no": {
+            "type": "string",
+            "description": "6位数字股票代码，如 600000"
+          },
+          "amount": {
+            "type": "integer",
+            "description": "卖出股数"
+          },
+          "price": {
+            "type": "number",
+            "description": "限价卖出价格。不传则走同花顺市价委托(五档即成剩撤)立即成交、剩余自动撤销、无残留挂单；传则限价挂单，需自行 orders_active/cancel 管理。"
+          },
+          "client_order_id": {
+            "type": "string",
+            "description": "客户端订单 ID，**幂等键**：同一 id 重复提交只会下单一次，重发返回首次回执（首次结果未知时返回 unknown_outcome，仍不会产生第二次提交）。超时后的安全动作就是用同一 id 原样重发。该 id 不写入柜台，仅存于受控端台账，orders_active/orders_filled 尽力回显（回查不到合同编号的单与外部单为 null）。建议全局唯一并含账户维度。"
+          }
+        },
+        "required": [
+          "stock_no",
+          "amount"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "cancel",
+      "description": "撤销指定委托编号的未成交订单。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "entrust_no": {
+            "type": "string",
+            "description": "要撤销的委托编号（从 orders_active 中获取）"
+          },
+          "client_order_id": {
+            "type": "string",
+            "description": "客户端订单 ID，**幂等键**：同一 id 重复提交只会下单一次，重发返回首次回执（首次结果未知时返回 unknown_outcome，仍不会产生第二次提交）。超时后的安全动作就是用同一 id 原样重发。该 id 不写入柜台，仅存于受控端台账，orders_active/orders_filled 尽力回显（回查不到合同编号的单与外部单为 null）。建议全局唯一并含账户维度。"
+          }
+        },
+        "required": [
+          "entrust_no"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "switch_account",
+      "description": "切换同花顺客户端当前活跃的资金账户（向 xiadan 窗口发送 Alt+N，N=账户在客户端账户下拉列表中的槽位序号）。仅在 xiadan 登录了多个账户时有意义。**盲切**：本工具不核验切换是否成功，受控端对账户身份无感知；切换后所有工具(查询/下单)都作用于新的当前账户。调用方必须紧接着用 balance/position 做指纹核对、确认账户无误后再继续操作。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "slot": {
+            "type": "integer",
+            "description": "账户槽位序号（1-9），对应快捷键 Alt+N，与客户端账户下拉列表顺序一致",
+            "minimum": 1,
+            "maximum": 9
+          }
+        },
+        "required": [
+          "slot"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "query_order",
+      "description": "按 client_order_id 查单（契约 v2 C5b）。返回 state（未报/已报/部成/已成/已撤/废单/未知）＋首次回执快照＋分辨率 resolution：by_entrust_no=按合同编号精确命中；heuristic=台账无合同编号时按代码/数量匹配，存在同参重复单歧义；unresolved=实表中无法唯一定位，state=未知需人工。与 buy/sell/cancel 的幂等（同 id 重发不重复下单）配对使用。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "client_order_id": {
+            "type": "string",
+            "description": "下单时传入的 client_order_id"
+          }
+        },
+        "required": [
+          "client_order_id"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "contract_version": "2"
+}

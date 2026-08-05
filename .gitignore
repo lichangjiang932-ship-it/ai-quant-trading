@@ -57,6 +57,7 @@ ENV/
 # 工作目录/本地状态(不上传)
 .workbuddy/
 .claude/
+data/*.db
 data/*.db-shm
 data/*.db-wal
 *.webp
@@ -64,6 +65,7 @@ logs/
 
 # 本地垃圾/缓存(不上传)
 .tmp/
+.codex_tmp/
 .pytest_cache/
 __pycache__/
 *.bak
