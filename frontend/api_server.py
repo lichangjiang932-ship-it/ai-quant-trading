@@ -4074,6 +4074,167 @@ async def _premarket_scheduler_loop():
         await asyncio.sleep(30)
 
 
+# ===========================================================================
+# 实盘交易端点 — 基金 (爱基金) & 股票 (guling-trader/同花顺)
+# 项目内直接完成真实交易, 不依赖 WorkBuddy。
+# ===========================================================================
+
+def _fund_trader():
+    from src.trading.fund_trader import FundTrader
+    return FundTrader()
+
+
+def _stock_trader():
+    from src.trading.stock_trader import StockTrader
+    return StockTrader.from_config()
+
+
+@app.get("/api/fund/holdings")
+def fund_holdings():
+    """基金 + 钱包持仓。"""
+    try:
+        holdings = _fund_trader().get_all_holdings()
+        return JSONResponse({"success": True, "data": holdings})
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)})
+
+
+@app.post("/api/fund/buy")
+def fund_buy(body: dict):
+    """基金申购 (金额)。
+
+    body: {fund_code, amount, pay_type: 'wallet'|'bank' (默认 wallet),
+           trans_account_id?, cust_id?}
+    """
+    try:
+        fund_code = str(body.get('fund_code', '')).strip()
+        amount = float(body.get('amount', 0))
+        if not fund_code or amount <= 0:
+            return JSONResponse({"success": False, "error": "fund_code 和 amount(>0) 必填"})
+        pay_type = str(body.get('pay_type', 'wallet')).lower()
+        if pay_type not in ('wallet', 'bank'):
+            return JSONResponse({"success": False, "error": "pay_type 必须是 wallet 或 bank"})
+        result = _fund_trader().buy(
+            fund_code, amount,
+            pay_type=pay_type,
+            trans_account_id=str(body.get('trans_account_id', '') or ''),
+            cust_id=str(body.get('cust_id', '') or ''),
+        )
+        return JSONResponse({"success": True, "data": result})
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)})
+
+
+@app.post("/api/fund/redeem")
+def fund_redeem(body: dict):
+    """基金赎回 (份额)。
+
+    body: {fund_code, share_vol, trans_account_id, redemption_type: '1'|'0'}
+    """
+    try:
+        fund_code = str(body.get('fund_code', '')).strip()
+        share_vol = float(body.get('share_vol', 0))
+        trans_account_id = str(body.get('trans_account_id', '') or '')
+        if not fund_code or share_vol <= 0 or not trans_account_id:
+            return JSONResponse({"success": False, "error": "fund_code/share_vol/trans_account_id 必填"})
+        redemption_type = str(body.get('redemption_type', '1'))
+        result = _fund_trader().redeem(
+            fund_code, share_vol, trans_account_id,
+            redemption_type=redemption_type,
+        )
+        return JSONResponse({"success": True, "data": result})
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)})
+
+
+@app.get("/api/fund/orders")
+def fund_orders(cust_id: Optional[str] = None, days: int = Query(30, ge=1, le=180),
+                limit: int = Query(20, ge=1, le=200)):
+    """基金交易记录。"""
+    try:
+        if not cust_id:
+            cust_id = str(config.get('fund.cust_id', '') or '')
+        if not cust_id:
+            return JSONResponse({"success": False, "error": "缺少 cust_id (body 传参或配置 fund.cust_id)"})
+        rows = _fund_trader().get_order_list(cust_id, limit=limit)
+        return JSONResponse({"success": True, "data": rows})
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)})
+
+
+@app.get("/api/fund/order/{serial}")
+def fund_order_detail(serial: str):
+    """基金订单详情。"""
+    try:
+        detail = _fund_trader().get_order_detail(serial)
+        return JSONResponse({"success": True, "data": detail})
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)})
+
+
+@app.post("/api/fund/revoke")
+def fund_revoke(body: dict):
+    """基金撤单。body: {serial}"""
+    try:
+        serial = str(body.get('serial', '') or '').strip()
+        if not serial:
+            return JSONResponse({"success": False, "error": "serial 必填"})
+        result = _fund_trader().revoke(serial)
+        return JSONResponse({"success": True, "data": result})
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)})
+
+
+@app.get("/api/live/status")
+def live_status():
+    """股票实盘连接状态 + 账户 + 持仓 + 在飞委托。"""
+    try:
+        trader = _stock_trader()
+        snap = trader.snapshot()
+        return JSONResponse({"success": True, "data": snap})
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)})
+
+
+@app.post("/api/live/order")
+def live_order(body: dict):
+    """股票实盘下单。
+
+    body: {symbol, side: 'buy'|'sell', quantity, price?, reason?, auto_trade?}
+    注意: 受 config.yaml trading.auto_trade 门禁, 未开启时返回 blocked。
+    """
+    try:
+        symbol = str(body.get('symbol', '')).strip()
+        side = str(body.get('side', 'buy')).lower()
+        quantity = int(body.get('quantity', 0) or 0)
+        if not symbol or quantity <= 0 or side not in ('buy', 'sell'):
+            return JSONResponse({"success": False, "error": "symbol/side(buy|sell)/quantity(>0) 必填"})
+        price = float(body.get('price') or 0) or None
+        reason = str(body.get('reason', 'api_live'))[:500]
+        trader = _stock_trader()
+        if side == 'buy':
+            result = trader.buy(symbol, quantity, price, reason)
+        else:
+            result = trader.sell(symbol, quantity, price, reason)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)})
+
+
+@app.post("/api/live/cancel")
+def live_cancel(body: dict):
+    """股票实盘撤单。body: {entrust_no}"""
+    try:
+        entrust_no = str(body.get('entrust_no', '') or '').strip()
+        if not entrust_no:
+            return JSONResponse({"success": False, "error": "entrust_no 必填"})
+        trader = _stock_trader()
+        ok, msg = trader.cancel_order(entrust_no)
+        return JSONResponse({"success": ok, "message": msg})
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)})
+
+
 def main():
     port = config.get('server.port', 8080)
     host = config.get('server.host', '127.0.0.1')

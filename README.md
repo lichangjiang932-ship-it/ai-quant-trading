@@ -406,6 +406,68 @@ results = opt.optimize({
 print(results.head())
 ```
 
+## 实盘交易（基金 & 股票，项目内完成，不依赖 WorkBuddy）
+
+项目内置完整交易层 `src/trading/`，通过 CLI 和 HTTP API 直接完成真实交易。
+
+### 前置准备
+
+```bash
+# 1. 基金: 初始化爱基金凭证 (INIT_TOKEN 在同花顺 App → 理财 → 基金 Skill 页面)
+D:/py/python.exe -c "from aijijin_sdk import init; init('你的INIT_TOKEN')"
+
+# 2. 股票: 运行 guling-trader.exe 并配对, 将 agent_token 填入 config.yaml
+#    broker.guling_agent_token = "你的agent_token"
+```
+
+### CLI 交易 (`python trade.py`)
+
+```bash
+# ---- 基金 (爱基金) ----
+python trade.py fund holdings                 # 基金 + 钱包持仓
+python trade.py fund buy 000001 1000          # 申购 1000 元 (默认钱包支付)
+python trade.py fund buy 000001 1000 --bank   # 银行卡支付
+python trade.py fund redeem 000001 500 账户ID  # 赎回 500 份
+python trade.py fund orders                   # 最近交易记录
+python trade.py fund order <单号>              # 订单详情
+python trade.py fund revoke <单号>             # 撤单
+python trade.py fund init                      # 凭证初始化指引
+
+# ---- 股票 (guling-trader/同花顺实盘) ----
+python trade.py stock status                  # 账户 + 持仓 + 在飞委托
+python trade.py stock buy 600519 100          # 市价买入
+python trade.py stock buy 600519 100 --price 1700.0   # 限价买入
+python trade.py stock sell 600519 100         # 卖出
+python trade.py stock cancel <委托号>          # 撤单
+python trade.py stock connect                 # 测试 guling-trader 连接
+```
+
+所有真实下单命令默认需要输入 `y` 确认；加 `--yes` 跳过。
+股票实盘受 `config.yaml` 的 `trading.auto_trade` 门禁，未开启时只记录不执行。
+
+### HTTP API (FastAPI, `frontend/api_server.py`)
+
+| 端点 | 说明 |
+|------|------|
+| `GET /api/fund/holdings` | 基金 + 钱包持仓 |
+| `POST /api/fund/buy` | 基金申购 `{fund_code, amount, pay_type}` |
+| `POST /api/fund/redeem` | 基金赎回 `{fund_code, share_vol, trans_account_id}` |
+| `GET /api/fund/orders?cust_id=` | 基金交易记录 |
+| `GET /api/fund/order/{serial}` | 基金订单详情 |
+| `POST /api/fund/revoke` | 基金撤单 `{serial}` |
+| `GET /api/live/status` | 股票账户 + 持仓 + 委托 |
+| `POST /api/live/order` | 股票下单 `{symbol, side, quantity, price?}` |
+| `POST /api/live/cancel` | 股票撤单 `{entrust_no}` |
+
+### 安全机制
+
+| 层级 | 说明 |
+|------|------|
+| 凭证隔离 | 基金 token 在 `~/.aijijin/credentials.json`；股票密码不离开同花顺 |
+| auto_trade 门禁 | `trading.auto_trade: false` 时股票只记录不执行 |
+| 交互确认 | CLI 真实下单需输入 `y`；API 需显式传参 |
+| 幂等键 | 股票下单带 `client_order_id`，重复调用不重复下单 |
+
 ## Web 监控面板
 
 启动 `streamlit run dashboard.py` 后访问 http://localhost:8501:

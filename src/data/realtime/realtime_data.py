@@ -556,3 +556,20 @@ class RealtimeData:
         self.running = False
         self._stop_event.set()
         self.callbacks = []
+
+    def close(self):
+        """释放所有连接资源 (含 mootdx 心跳线程)。"""
+        self.stop_realtime_monitor()
+        with self._mootdx_lock:
+            if self._mootdx_source is not None:
+                try:
+                    self._mootdx_source.close()
+                except Exception:
+                    pass
+                self._mootdx_source = None
+        if self._pytdx_client is not None:
+            try:
+                self._pytdx_client.close()
+            except Exception:
+                pass
+            self._pytdx_client = None

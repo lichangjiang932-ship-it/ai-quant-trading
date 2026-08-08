@@ -76,6 +76,16 @@ class MootdxSource:
             return self._ensure_client()
         return self._available
 
+    def close(self):
+        """关闭 mootdx 连接 (停止心跳线程)。"""
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+            self._client = None
+        self._available = None
+
     def kline(self, code: str, category: int = 4, offset: int = 100) -> pd.DataFrame:
         """
         K线数据。
