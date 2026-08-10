@@ -507,6 +507,187 @@ class FundTrader:
     def md5(text: str) -> str:
         return hashlib.md5(text.encode()).hexdigest()
 
+    # ------------------------------------------------------------------
+    # 增强: 基金详情 / 订单状态 / 赎回预估
+    # ------------------------------------------------------------------
+
+    def get_fund_info(self, fund_code: str) -> Dict:
+        """聚合基金完整详情: 基本信息 + 费率 + 风险等级 + 购买规则。
+
+        组合 subscribe_init + get_fund_fee, 供下单前展示。
+        """
+        init_data = self.subscribe_init(fund_code)
+        bean = init_data.get("paramOpenFundAccBean", {}) or {}
+        fee = self.get_fund_fee(fund_code)
+        rate_info = fee.get("rateInfo", {}) or {}
+        return {
+            "fundCode": fund_code,
+            "fundName": bean.get("fundName", ""),
+            "minBuy": init_data.get("minBuy"),
+            "minAddBuy": (bean.get("minAddBuy") or init_data.get("minAddBuy")),
+            "maxBuy": init_data.get("maxBuy"),
+            "fundRiskLevel": init_data.get("fundRiskLevel"),
+            "clientRiskLevel": init_data.get("ov_clientriskrate"),
+            "riskFlag": init_data.get("ov_flag"),
+            "supportWallet": init_data.get("moneytostockTzeroFlag"),
+            "bankDiscount": init_data.get("bankBuyDiscount"),
+            "walletDiscount": init_data.get("moneyToStockBuyDiscount"),
+            "hasLockPeriod": bean.get("hasLockPeriod"),
+            "isRollingHold": bean.get("isRollingHold"),
+            "hasRedeemDate": bean.get("hasRedeemDate"),
+            "appkday": bean.get("appkday"),
+            "confirmDay": bean.get("confirmDay"),
+            "managementFee": rate_info.get("glf"),
+            "custodyFee": rate_info.get("tgf"),
+            "serviceFee": rate_info.get("fwf"),
+            "purchaseFeeTiers": [
+                {"min": q.get("money"), "rate": q.get("rate")}
+                for q in ((rate_info.get("sg") or {}).get("qd") or [])
+            ],
+            "redeemFeeTiers": (rate_info.get("sh") or [])
+            if isinstance(rate_info.get("sh"), list) else rate_info.get("sh"),
+            "walletAccounts": init_data.get("fundtzeroList") or [],
+            "bankAccounts": self._normalize_bank_accounts(init_data),
+            "custId": init_data.get("custId"),
+            "validateMessage": (init_data.get("accountValidateResult") or {}).get(
+                "validateMessage"
+            ),
+        }
+
+    @staticmethod
+    def _normalize_bank_accounts(init_data: Dict) -> List[Dict]:
+        """统一银行卡账户为 list[dict] (兼容裸 list 与 dict 包装)。"""
+        raw = init_data.get("bankCardSplitListResult") or []
+        if isinstance(raw, dict):
+            raw = raw.get("list") or []
+        return raw or init_data.get("bankCardList") or []
+
+    @staticmethod
+    def judge_order_status(detail: Dict) -> Dict:
+        """按官方规则判定订单状态 (confirmFlag + checkFlag 组合)。
+
+        Returns: {"status": str, "label": str, "reason": str}
+          status: success / processing / failed / partial / revoked / unknown
+        """
+        confirm = str(detail.get("confirmFlag", ""))
+        check = str(detail.get("checkFlag", ""))
+        fail = detail.get("failMsg") or {}
+
+        def _fail_reason() -> str:
+            return fail.get("thsMessage") or fail.get("message") or ""
+
+        # 优先级 1: confirmFlag=3 → 成功
+        if confirm == "3":
+            return {"status": "success", "label": "交易成功", "reason": ""}
+        # 优先级 2: checkFlag=0 且 confirmFlag=0 → 成功
+        if check == "0" and confirm == "0":
+            return {"status": "success", "label": "交易成功", "reason": ""}
+        # 优先级 3: confirmFlag=0 且 checkFlag!=0 → 处理中
+        if confirm == "0" and check != "0":
+            return {"status": "processing", "label": "交易处理中", "reason": "请稍后重新查询结果"}
+        # 优先级 4: confirmFlag=6 且 checkFlag!=0 → 失败
+        if confirm == "6" and check != "0":
+            return {"status": "failed", "label": "交易失败", "reason": _fail_reason()}
+        # 优先级 5: confirmFlag=4 → 基金公司确认失败
+        if confirm == "4":
+            return {"status": "failed", "label": "基金公司确认失败", "reason": _fail_reason()}
+        # 优先级 6: confirmFlag=2 → 部分确认
+        if confirm == "2":
+            return {"status": "partial", "label": "部分确认成功", "reason": ""}
+        # 优先级 7: confirmFlag=1 → 已撤单
+        if confirm == "1":
+            return {"status": "revoked", "label": "已撤单", "reason": ""}
+        return {"status": "unknown", "label": "状态待确认", "reason": "暂时无法确认订单状态，请稍后重新查询"}
+
+    def estimate_redeem(
+        self, fund_code: str, trans_account_id: str, share_vol: Optional[float] = None
+    ) -> Dict:
+        """赎回预估: 净值 / 可赎份额 / 费率档位 / 预估手续费与到账。
+
+        Args:
+            share_vol: 目标赎回份额; None 表示展示全部可用份额的预估
+        """
+        render = self.redeem_render(fund_code, trans_account_id)
+        fund_info = render.get("fundInfo", {}) or {}
+        nav = float(fund_info.get("nav") or 0)
+        max_vol = float(fund_info.get("maxRedemptionVol") or 0)
+        min_vol = float(fund_info.get("minRedemptionVol") or 0)
+        target = share_vol if share_vol is not None else max_vol
+        target = min(target, max_vol)
+
+        # 费率: stepRates (持有天数 → 费率) 或 fundInfo 简化档位
+        steps = render.get("stepRates") or []
+        fee_rate = 0.0
+        if steps:
+            # 取最高持有档 (最优惠) 作为保守预估下限; 无持有天数时取第一条
+            fee_rate = float(steps[-1].get("rate") or 0) / 100.0
+        amount = nav * target
+        fee = amount * fee_rate
+        arrival = amount - fee
+        return {
+            "fundCode": fund_code,
+            "nav": nav,
+            "availableVol": max_vol,
+            "minVol": min_vol,
+            "targetVol": target,
+            "estimatedAmount": amount,
+            "feeRatePct": fee_rate * 100,
+            "estimatedFee": fee,
+            "estimatedArrival": arrival,
+            "canRedeemToWallet": fund_info.get("canRedeemToWallet"),
+            "walletUsable": (render.get("walletInfo") or {}).get("usable"),
+            "shareList": render.get("shareList") or [],
+        }
+
+    # ------------------------------------------------------------------
+    # 增强: 交易记录分页
+    # ------------------------------------------------------------------
+
+    def get_order_list_page(
+        self,
+        cust_id: str,
+        offset: int = 1,
+        limit: int = 20,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        last_accept_time: Optional[str] = None,
+        last_serial: Optional[str] = None,
+    ) -> Dict:
+        """交易记录分页 (游标)。返回 {list, has_more, last_accept_time, last_serial}。"""
+        if not start_date:
+            start_date = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
+        if not end_date:
+            end_date = datetime.now().strftime("%Y%m%d")
+        body: Dict[str, Any] = {
+            "custId": cust_id,
+            "offset": offset,
+            "limit": limit,
+            "startDate": start_date,
+            "endDate": end_date,
+            "opBusinessCode": "all",
+            "opProductType": "all",
+            "queryProcessing": False,
+        }
+        if offset != 1:
+            if not last_accept_time or not last_serial:
+                raise FundTraderError("翻页必须同时提供 last_accept_time 和 last_serial")
+            body["lastAcceptTime"] = last_accept_time
+            body["lastAppSheetSerialNo"] = last_serial
+        data = self._request("POST", "/order/v2/ai/orderlist", json_body=body)
+        self._check_ok(data, "查询交易记录")
+        result = data.get("data", {})
+        if isinstance(result, dict):
+            rows = result.get("list") or result.get("records") or []
+            has_more = bool(result.get("hasMore") or len(rows) >= limit)
+            return {
+                "list": rows,
+                "has_more": has_more,
+                "last_accept_time": rows[-1].get("acceptTime") if rows else None,
+                "last_serial": rows[-1].get("appSheetSerialNo") if rows else None,
+                "total": result.get("total"),
+            }
+        return {"list": [], "has_more": False}
+
 
 def format_holdings(holdings: Dict) -> str:
     """把持仓 dict 格式化为可读文本。"""
@@ -536,4 +717,55 @@ def format_holdings(holdings: Dict) -> str:
     lines.insert(0, f"基金持仓 ({len(fund_rows)} 只, 市值 {total_value:.2f} 元, 收益 {total_income:.2f} 元)")
     if wallet_value:
         lines.append(f"  钱包资产: {wallet_value:.2f} 元")
+    return "\n".join(lines)
+
+
+def format_fund_info(info: Dict) -> str:
+    """把基金详情 dict 格式化为可读文本 (下单前展示用)。"""
+    lines: List[str] = []
+    lines.append(f"基金: {info.get('fundName', '')}({info.get('fundCode', '')})")
+    lines.append(f"  起购金额: {info.get('minBuy', '-')} 元 | 追加: {info.get('minAddBuy', '-')} 元 | 单笔最大: {info.get('maxBuy', '-')} 元")
+    risk_f = info.get("fundRiskLevel")
+    risk_c = info.get("clientRiskLevel")
+    lines.append(f"  风险等级: 产品 R{risk_f} / 客户 C{risk_c}" if risk_f and risk_c else "  风险等级: 未知")
+    if info.get("hasLockPeriod") == "1":
+        lines.append("  ⚠️ 该基金有封闭锁定期")
+    if info.get("isRollingHold") == "1":
+        lines.append("  ⚠️ 滚动持有型基金")
+    lines.append("  持有期间费用:")
+    lines.append(f"    管理费 {info.get('managementFee', '-')} | 托管费 {info.get('custodyFee', '-')} | 销售服务费 {info.get('serviceFee', '-')}")
+    tiers = info.get("purchaseFeeTiers") or []
+    if tiers:
+        lines.append("  申购阶梯费率:")
+        for q in tiers:
+            lines.append(f"    {q.get('min', '?')} → {q.get('rate', '?')}")
+    if info.get("bankDiscount"):
+        lines.append(f"  银行卡折扣: {info.get('bankDiscount')}")
+    if info.get("walletDiscount"):
+        lines.append(f"  钱包折扣: {info.get('walletDiscount')}")
+    vm = info.get("validateMessage")
+    if vm:
+        lines.append(f"  提示: {vm}")
+    return "\n".join(lines)
+
+
+def format_order_detail(detail: Dict, status: Optional[Dict] = None) -> str:
+    """把订单详情格式化为可读文本 (按官方展示约束, 不暴露底层状态码)。"""
+    if status is None:
+        from .fund_trader import FundTrader
+        status = FundTrader.judge_order_status(detail)
+    lines: List[str] = []
+    lines.append(f"订单: {detail.get('fundName', '')}({detail.get('fundCode', '')})")
+    lines.append(f"  状态: {status.get('label', '')}")
+    if status.get("reason"):
+        lines.append(f"  原因: {status['reason']}")
+    amt = detail.get("applicationAmount") or detail.get("applicationVol")
+    if amt:
+        lines.append(f"  金额/份额: {amt}")
+    if detail.get("acceptTime"):
+        lines.append(f"  受理时间: {detail['acceptTime']}")
+    if detail.get("exceptCfmDate"):
+        lines.append(f"  预计确认: {detail['exceptCfmDate']}")
+    if detail.get("bankName"):
+        lines.append(f"  资金来源: {detail.get('bankName', '')} ({detail.get('bankAccount', '')})")
     return "\n".join(lines)

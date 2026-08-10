@@ -425,13 +425,16 @@ D:/py/python.exe -c "from aijijin_sdk import init; init('你的INIT_TOKEN')"
 ```bash
 # ---- 基金 (爱基金) ----
 python trade.py fund holdings                 # 基金 + 钱包持仓
-python trade.py fund buy 000001 1000          # 申购 1000 元 (默认钱包支付)
+python trade.py fund info 000001              # 基金详情 (费率/风险/购买规则)
+python trade.py fund buy 000001 1000          # 申购 1000 元 (申购前展示费率+风险提示)
 python trade.py fund buy 000001 1000 --bank   # 银行卡支付
-python trade.py fund redeem 000001 500 账户ID  # 赎回 500 份
-python trade.py fund orders                   # 最近交易记录
-python trade.py fund order <单号>              # 订单详情
+python trade.py fund redeem 000001 500        # 赎回 500 份 (账户自动获取 + 到账预估)
+python trade.py fund redeem 000001 500 账户ID  # 指定账户赎回
+python trade.py fund orders                   # 最近交易记录 (中文状态)
+python trade.py fund order <单号>              # 订单详情 (中文状态判定)
 python trade.py fund revoke <单号>             # 撤单
 python trade.py fund init                      # 凭证初始化指引
+python trade.py fund status                   # 凭证/设备授权/Work Token 检查
 
 # ---- 股票 (guling-trader/同花顺实盘) ----
 python trade.py stock status                  # 账户 + 持仓 + 在飞委托
@@ -450,10 +453,11 @@ python trade.py stock connect                 # 测试 guling-trader 连接
 | 端点 | 说明 |
 |------|------|
 | `GET /api/fund/holdings` | 基金 + 钱包持仓 |
+| `GET /api/fund/info/{code}` | 基金详情 (费率/风险/购买规则) |
 | `POST /api/fund/buy` | 基金申购 `{fund_code, amount, pay_type}` |
 | `POST /api/fund/redeem` | 基金赎回 `{fund_code, share_vol, trans_account_id}` |
-| `GET /api/fund/orders?cust_id=` | 基金交易记录 |
-| `GET /api/fund/order/{serial}` | 基金订单详情 |
+| `GET /api/fund/orders?cust_id=` | 基金交易记录 (含中文状态) |
+| `GET /api/fund/order/{serial}` | 基金订单详情 (含中文状态) |
 | `POST /api/fund/revoke` | 基金撤单 `{serial}` |
 | `GET /api/live/status` | 股票账户 + 持仓 + 委托 |
 | `POST /api/live/order` | 股票下单 `{symbol, side, quantity, price?}` |

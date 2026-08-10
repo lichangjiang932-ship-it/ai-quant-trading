@@ -132,3 +132,63 @@ class TestLiveApiEndpoints:
         body = r.json()
         assert body.get("success") is False
         assert "INIT_TOKEN" in str(body.get("error", ""))
+
+
+class TestFundOrderStatus:
+    """订单状态判定 (官方 confirmFlag/checkFlag 组合规则)。"""
+
+    def _judge(self, **kw):
+        from src.trading.fund_trader import FundTrader
+        return FundTrader.judge_order_status(kw)
+
+    def test_success_confirm_3(self):
+        s = self._judge(confirmFlag="3", checkFlag="1")
+        assert s["status"] == "success"
+
+    def test_success_check_0_confirm_0(self):
+        s = self._judge(confirmFlag="0", checkFlag="0")
+        assert s["status"] == "success"
+
+    def test_processing(self):
+        s = self._judge(confirmFlag="0", checkFlag="1")
+        assert s["status"] == "processing"
+
+    def test_failed_with_reason(self):
+        s = self._judge(confirmFlag="6", checkFlag="1",
+                        failMsg={"thsMessage": "余额不足", "message": "fallback"})
+        assert s["status"] == "failed"
+        assert s["reason"] == "余额不足"  # 优先 thsMessage
+
+    def test_failed_fallback_message(self):
+        s = self._judge(confirmFlag="6", checkFlag="1",
+                        failMsg={"thsMessage": "", "message": "fallback"})
+        assert s["status"] == "failed"
+        assert s["reason"] == "fallback"
+
+    def test_partial(self):
+        s = self._judge(confirmFlag="2", checkFlag="1")
+        assert s["status"] == "partial"
+
+    def test_revoked(self):
+        s = self._judge(confirmFlag="1", checkFlag="1")
+        assert s["status"] == "revoked"
+
+    def test_unknown(self):
+        s = self._judge()
+        assert s["status"] == "unknown"
+
+
+class TestFundInfoEndpoint:
+    """/api/fund/info 端点。"""
+
+    def _client(self):
+        from fastapi.testclient import TestClient
+        import frontend.api_server as api
+        return TestClient(api.app)
+
+    def test_info_endpoint_registered(self):
+        """端点存在即可 (真实数据依赖网络, 不在此断言内容)。"""
+        r = self._client().get("/api/fund/info/000001")
+        assert r.status_code == 200
+        body = r.json()
+        assert "success" in body

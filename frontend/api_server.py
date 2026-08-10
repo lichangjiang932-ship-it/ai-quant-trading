@@ -4150,23 +4150,40 @@ def fund_redeem(body: dict):
 @app.get("/api/fund/orders")
 def fund_orders(cust_id: Optional[str] = None, days: int = Query(30, ge=1, le=180),
                 limit: int = Query(20, ge=1, le=200)):
-    """基金交易记录。"""
+    """基金交易记录 (含中文状态)。"""
     try:
         if not cust_id:
             cust_id = str(config.get('fund.cust_id', '') or '')
         if not cust_id:
             return JSONResponse({"success": False, "error": "缺少 cust_id (body 传参或配置 fund.cust_id)"})
         rows = _fund_trader().get_order_list(cust_id, limit=limit)
+        from src.trading.fund_trader import FundTrader
+        for r in rows:
+            st = FundTrader.judge_order_status(r)
+            r["_status"] = st
         return JSONResponse({"success": True, "data": rows})
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)})
+
+
+@app.get("/api/fund/info/{code}")
+def fund_info(code: str):
+    """基金完整详情: 基本信息 + 费率 + 风险等级 + 购买规则。"""
+    try:
+        info = _fund_trader().get_fund_info(code)
+        return JSONResponse({"success": True, "data": info})
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)})
 
 
 @app.get("/api/fund/order/{serial}")
 def fund_order_detail(serial: str):
-    """基金订单详情。"""
+    """基金订单详情 (含中文状态判定)。"""
     try:
+        from src.trading.fund_trader import FundTrader
         detail = _fund_trader().get_order_detail(serial)
+        status = FundTrader.judge_order_status(detail)
+        detail["_status"] = status
         return JSONResponse({"success": True, "data": detail})
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)})

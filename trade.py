@@ -130,12 +130,32 @@ def cmd_fund_holdings(_args):
 def cmd_fund_buy(args):
     trader = _fund_trader()
     pay_type = "wallet" if args.pay == "wallet" else "bank"
-    if not _yes(args.yes, f"基金申购 {args.code} 金额 {args.amount} 元 (支付: {pay_type})"):
+    amount = float(args.amount)
+
+    # 申购前展示基金详情 + 风险等级提示
+    try:
+        info = trader.get_fund_info(args.code)
+        from src.trading.fund_trader import format_fund_info
+        print("=== 基金信息 ===")
+        print(format_fund_info(info))
+        print()
+        # 风险等级不匹配提示
+        fr = info.get("fundRiskLevel")
+        cr = info.get("clientRiskLevel")
+        if fr and cr and int(fr) > int(cr):
+            print(f"⚠️  风险提示: 产品风险 R{fr} 高于您的风险承受能力 C{cr}!")
+            print("    如继续申购请自行确认风险承受能力。")
+            print()
+    except Exception as e:
+        print(f"[提示] 无法获取基金详情: {e}")
+        print()
+
+    if not _yes(args.yes, f"基金申购 {args.code} 金额 {amount} 元 (支付: {pay_type})"):
         print("已取消")
         return 1
     try:
         result = trader.buy(
-            args.code, float(args.amount), pay_type=pay_type,
+            args.code, amount, pay_type=pay_type,
         )
     except Exception as e:
         print(f"[错误] {e}")
@@ -143,21 +163,64 @@ def cmd_fund_buy(args):
     print(f"✅ 申购委托已提交: 单号 {result['appSheetSerialNo']}")
     detail = result.get("detail") or {}
     if detail:
-        print(f"   基金: {detail.get('fundName', '')}({detail.get('fundCode', '')})")
-        print(f"   金额: {detail.get('applicationAmount', '')} 元")
-        print(f"   受理: {detail.get('acceptTime', '')} 预计确认: {detail.get('exceptCfmDate', '')}")
+        from src.trading.fund_trader import FundTrader, format_order_detail
+        status = FundTrader.judge_order_status(detail)
+        print()
+        print(format_order_detail(detail, status))
     return 0
 
 
 def cmd_fund_redeem(args):
     trader = _fund_trader()
     redemption_type = "1" if args.pay == "wallet" else "0"
+    account = args.account
+
+    # 未指定账户时: 从持仓自动查找
+    if not account:
+        try:
+            holdings = trader.get_all_holdings()
+            found = None
+            for r in (holdings.get("fundList") or []):
+                if r.get("fundCode") == args.code:
+                    detail_list = r.get("fundPositonDetailList") or []
+                    if detail_list:
+                        acc0 = detail_list[0]
+                        found = acc0.get("transactionAccountId") or acc0.get("transActionAccountId")
+                    if found:
+                        break
+            if not found:
+                # 兜底: 用钱包账户
+                init = trader.subscribe_init(args.code)
+                found = trader._pick_account(init, "wallet")
+            account = str(found)
+            print(f"自动选择账户: {account}")
+        except Exception as e:
+            print(f"[错误] 无法自动获取账户: {e}")
+            return 1
+
+    # 赎回预估展示
+    try:
+        est = trader.estimate_redeem(args.code, account, float(args.shares))
+        print("=== 赎回预估 ===")
+        print(f"  基金: {args.code}")
+        print(f"  单位净值: {est['nav']}")
+        print(f"  可用份额: {est['availableVol']}")
+        print(f"  赎回份额: {est['targetVol']}")
+        print(f"  预估金额: {est['estimatedAmount']:.2f} 元")
+        print(f"  预估费率: {est['feeRatePct']:.4f}%")
+        print(f"  预估手续费: {est['estimatedFee']:.2f} 元")
+        print(f"  预估到账: {est['estimatedArrival']:.2f} 元")
+        print()
+    except Exception as e:
+        print(f"[提示] 无法获取赎回预估: {e}")
+        print()
+
     if not _yes(args.yes, f"基金赎回 {args.code} 份额 {args.shares} (方式: {args.pay})"):
         print("已取消")
         return 1
     try:
         result = trader.redeem(
-            args.code, float(args.shares), args.account,
+            args.code, float(args.shares), account,
             redemption_type=redemption_type,
         )
     except Exception as e:
@@ -166,9 +229,10 @@ def cmd_fund_redeem(args):
     print(f"✅ 赎回委托已提交: 单号 {result['appSheetSerialNo']}")
     detail = result.get("detail") or {}
     if detail:
-        print(f"   基金: {detail.get('fundName', '')}({detail.get('fundCode', '')})")
-        print(f"   份额: {detail.get('applicationVol', detail.get('shareVol', ''))}")
-        print(f"   受理: {detail.get('acceptTime', '')}")
+        from src.trading.fund_trader import FundTrader, format_order_detail
+        status = FundTrader.judge_order_status(detail)
+        print()
+        print(format_order_detail(detail, status))
     return 0
 
 
@@ -190,15 +254,18 @@ def cmd_fund_orders(args):
     if not rows:
         print("(无交易记录)")
         return 0
+    from src.trading.fund_trader import FundTrader
     print(f"交易记录 ({len(rows)} 条):")
+    biz_map = {"022": "申购", "023": "赎回", "024": "分红", "aip": "定投", "buy": "申购", "sell": "赎回"}
     for r in rows:
         name = r.get("fundName", "")
         code = r.get("fundCode", "")
-        biz = r.get("businessCode", "")
+        biz = biz_map.get(str(r.get("businessCode", "")), str(r.get("businessCode", "")))
         amt = r.get("applicationAmount", r.get("applicationVol", ""))
-        time_ = r.get("acceptTime", "")
-        status = r.get("confirmFlag", "")
-        print(f"  [{time_}] {name}({code}) {biz} {amt} status={status}")
+        time_ = r.get("acceptTime", "") or "-"
+        # 用状态判定显示中文状态
+        st = FundTrader.judge_order_status(r)
+        print(f"  [{time_}] {name}({code}) {biz} {amt} | {st['label']}")
     return 0
 
 
@@ -209,9 +276,22 @@ def cmd_fund_order(args):
     except Exception as e:
         print(f"[错误] {e}")
         return 1
-    for k, v in d.items():
-        if v not in (None, "", []):
-            print(f"  {k}: {v}")
+    from src.trading.fund_trader import FundTrader, format_order_detail
+    status = FundTrader.judge_order_status(d)
+    print(format_order_detail(d, status))
+    return 0
+
+
+def cmd_fund_info(args):
+    """查询基金完整详情 (费率/风险/购买规则)。"""
+    trader = _fund_trader()
+    try:
+        info = trader.get_fund_info(args.code)
+    except Exception as e:
+        print(f"[错误] {e}")
+        return 1
+    from src.trading.fund_trader import format_fund_info
+    print(format_fund_info(info))
     return 0
 
 
@@ -365,10 +445,10 @@ def main(argv=None) -> int:
     f_buy.add_argument("--yes", action="store_true", help="跳过确认")
     f_buy.set_defaults(func=cmd_fund_buy)
 
-    f_red = fund_sub.add_parser("redeem", help="基金赎回 (份额)")
+    f_red = fund_sub.add_parser("redeem", help="基金赎回 (份额, 账户可自动获取)")
     f_red.add_argument("code", help="基金代码")
     f_red.add_argument("shares", help="赎回份额")
-    f_red.add_argument("account", help="交易账户 ID (从持仓/初始化获取)")
+    f_red.add_argument("account", nargs="?", default="", help="交易账户 ID (留空自动从持仓获取)")
     f_red.add_argument("--wallet", dest="pay", action="store_const", const="wallet", default="wallet", help="钱包赎回 (默认)")
     f_red.add_argument("--bank", dest="pay", action="store_const", const="bank", help="银行卡赎回")
     f_red.add_argument("--yes", action="store_true", help="跳过确认")
@@ -378,6 +458,10 @@ def main(argv=None) -> int:
     f_orders.add_argument("--days", type=int, default=30, help="查询天数 (默认30)")
     f_orders.add_argument("--limit", type=int, default=20, help="条数")
     f_orders.set_defaults(func=cmd_fund_orders, start=None, end=None)
+
+    f_info = fund_sub.add_parser("info", help="基金详情 (费率/风险/购买规则)")
+    f_info.add_argument("code", help="基金代码")
+    f_info.set_defaults(func=cmd_fund_info)
 
     f_order = fund_sub.add_parser("order", help="订单详情")
     f_order.add_argument("serial", help="订单号 appSheetSerialNo")
