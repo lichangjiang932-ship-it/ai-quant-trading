@@ -10,16 +10,28 @@ if ROOT not in sys.path:
 
 
 class TestFundTraderErrors:
-    """基金交易错误处理 (凭证未初始化时给出友好指引)。"""
+    """基金交易错误处理 (用 monkeypatch 模拟凭证缺失, 不依赖本机凭证状态)。"""
 
-    def test_not_initialized_message(self):
+    def test_not_initialized_message(self, monkeypatch):
         from src.trading.fund_trader import FundTrader, FundNotInitializedError
+
+        def _fake_get_work_token(self):
+            raise FundNotInitializedError(
+                "爱基金凭证未初始化: 请先执行 ... init('你的INIT_TOKEN')"
+            )
+
+        monkeypatch.setattr(FundTrader, "_get_work_token", _fake_get_work_token)
         trader = FundTrader()
         with pytest.raises(FundNotInitializedError):
             trader._get_work_token()
 
-    def test_holding_initialized_error_propagates(self):
+    def test_holding_initialized_error_propagates(self, monkeypatch):
         from src.trading.fund_trader import FundTrader, FundNotInitializedError
+
+        def _fake_get_work_token(self):
+            raise FundNotInitializedError("爱基金凭证未初始化")
+
+        monkeypatch.setattr(FundTrader, "_get_work_token", _fake_get_work_token)
         trader = FundTrader()
         with pytest.raises(FundNotInitializedError):
             trader.get_all_holdings()
@@ -105,7 +117,17 @@ class TestLiveApiEndpoints:
         )
         assert r.json().get("success") is False
 
-    def test_fund_holdings_not_initialized_message(self):
+    def test_fund_holdings_not_initialized_message(self, monkeypatch):
+        """凭证缺失时 API 应返回友好 INIT_TOKEN 指引 (monkeypatch 模拟, 不依赖本机凭证)。"""
+        from src.trading import fund_trader
+        from src.trading.fund_trader import FundTrader, FundNotInitializedError
+
+        def _fake(self):
+            raise FundNotInitializedError(
+                "爱基金凭证未初始化: 请先执行 ... init('你的INIT_TOKEN')"
+            )
+
+        monkeypatch.setattr(FundTrader, "_get_work_token", _fake)
         r = self._client().get("/api/fund/holdings")
         body = r.json()
         assert body.get("success") is False

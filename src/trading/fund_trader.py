@@ -406,9 +406,12 @@ class FundTrader:
                     or acc.get("accountId")
                     or ""
                 )
-        bank_list = (init_data.get("bankCardSplitListResult") or {}).get(
-            "list"
-        ) or init_data.get("bankCardList") or []
+        # bankCardSplitListResult 本身即 list (实测结构, 非 {"list": [...]} 包装)
+        bank_list = init_data.get("bankCardSplitListResult") or []
+        if isinstance(bank_list, dict):
+            bank_list = bank_list.get("list") or []
+        if not bank_list:
+            bank_list = init_data.get("bankCardList") or []
         if bank_list:
             acc = bank_list[0]
             return str(

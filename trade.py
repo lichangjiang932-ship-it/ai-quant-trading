@@ -65,6 +65,56 @@ def _fund_trader():
     return FundTrader()
 
 
+def cmd_fund_status(_args):
+    """检查爱基金凭证 / 设备授权 / Work Token 状态。"""
+    import json
+    import os
+
+    print("=== 爱基金凭证状态检查 ===")
+    cred_path = os.path.expanduser("~/.aijijin/credentials.json")
+    if not os.path.exists(cred_path):
+        print("❌ 凭证文件不存在:", cred_path)
+        print("   请先执行:  D:/py/python.exe -c \"from aijijin_sdk import init; print('confirm_status=', init('你的INIT_TOKEN'))\"")
+        return 1
+
+    try:
+        d = json.load(open(cred_path, encoding="utf-8"))
+    except Exception as e:
+        print(f"❌ 凭证文件损坏: {e}")
+        return 1
+
+    dev = d.get("device", {})
+    rt = d.get("refresh_token") or {}
+    print(f"✅ 凭证文件: {cred_path}")
+    print(f"   版本: {d.get('version')}  更新时间: {d.get('updated_at')}")
+    print(f"   设备名称: {dev.get('device_name')}  平台: {dev.get('platform')}")
+    print(f"   设备哈希: {(dev.get('device_hash') or '')[:12]}...")
+    print(f"   Refresh Token: {'✅ 已写入' if rt.get('token') else '❌ 缺失'}")
+
+    print("\n=== Work Token 换取测试 ===")
+    from aijijin_sdk import get_work_token
+    try:
+        token = get_work_token()
+        print(f"✅ Work Token 获取成功 (长度 {len(token)}) — 设备已授权, 可以交易!")
+        return 0
+    except Exception as e:
+        name = type(e).__name__
+        code = getattr(e, "code", None)
+        print(f"❌ Work Token 获取失败: {name}")
+        if code:
+            print(f"   错误码: {code}")
+        print(f"   信息: {e}")
+        if str(code) in ("1406", "4001", "4002", "4003"):
+            print("\n👉 设备未授权: 请到【同花顺 App → 理财 tab → 基金 Skill 页面】")
+            print("   找到设备授权/设备管理入口, 确认这台设备:")
+            print(f"   设备名称: {dev.get('device_name')}  平台: {dev.get('platform')}")
+            print("   确认完成后重新运行本命令验证。")
+        elif "RefreshTokenExpired" in name or str(code) in ("1101", "1102", "1103"):
+            print("\n👉 Refresh Token 已失效: 请到同花顺 App 重新获取 INIT_TOKEN")
+            print("   然后执行: D:/py/python.exe -c \"from aijijin_sdk import init; init('新TOKEN')\"")
+        return 1
+
+
 def cmd_fund_holdings(_args):
     trader = _fund_trader()
     try:
@@ -340,6 +390,9 @@ def main(argv=None) -> int:
 
     f_init = fund_sub.add_parser("init", help="初始化凭证指引")
     f_init.set_defaults(func=cmd_fund_init)
+
+    f_status = fund_sub.add_parser("status", help="检查凭证/设备授权/Work Token 状态")
+    f_status.set_defaults(func=cmd_fund_status)
 
     # stock
     stock = sub.add_parser("stock", help="股票实盘 (guling-trader/同花顺)")

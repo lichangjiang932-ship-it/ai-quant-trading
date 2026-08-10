@@ -57,7 +57,7 @@ broker:
 # 凭证在 ~/.aijijin/credentials.json (由 aijijin-sdk init() 写入), 无需在此配置。
 # cust_id 可选: 首次申购后可从响应中获取, 填入后可直接查询交易记录。
 fund:
-  cust_id: ''
+  cust_id: '100126492181'
 capital:
   block_trade: true
   dividend: true
