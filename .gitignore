@@ -33,6 +33,18 @@ ENV/
 
 # Configuration (本仓库为私有, 按要求上传真实配置)
 
+# === 敏感文件 (禁止上传) ===
+# .env 含真实 API Key, 必须忽略。复制 .env.example 后填写。
+.env
+.env.local
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+credentials.json
+.aijijin/
+
 # Data files
 *.csv
 *.h5
