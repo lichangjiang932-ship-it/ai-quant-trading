@@ -2095,8 +2095,14 @@ def get_timeshare(symbol: str = Query("sh600000")):
 
 
 @app.get("/api/account")
-def get_account():
-    """获取账户信息"""
+def get_account(mode: str = Query("paper")):
+    """获取账户信息。
+
+    mode: paper=模拟盘(默认, 兼容旧前端) | live=实盘(基金+股票)
+    """
+    mode = mode.lower()
+    if mode == "live":
+        return _live_account_view()
     info = broker.get_account_info()
     return JSONResponse({
         "total_asset": float(info.get('total_asset', 0) or 0),
@@ -2120,13 +2126,59 @@ def get_account():
     })
 
 
+def _live_account_view():
+    """实盘账户视图 (基金 + 股票聚合)。"""
+    try:
+        from src.trading import get_live_snapshot
+        snap = get_live_snapshot(config_path=CONFIG_PATH)
+        return JSONResponse({
+            "total_asset": round(snap.get("total_assets", 0), 2),
+            "cash": round(snap.get("cash", 0), 2),
+            "market_value": round(snap.get("market_value", 0), 2),
+            "profit": round(snap.get("profit", 0), 2),
+            "profit_pct": round(snap.get("profit_pct", 0), 2),
+            "positions": len(snap.get("positions", [])),
+            "mode": "live",
+            "fund": snap.get("fund"),
+            "stock": snap.get("stock"),
+            "warnings": snap.get("warnings", []),
+        })
+    except Exception as e:
+        return JSONResponse({
+            "mode": "live", "total_asset": 0, "cash": 0, "market_value": 0,
+            "profit": 0, "profit_pct": 0, "positions": 0,
+            "error": str(e), "warnings": [str(e)],
+        })
+
+
+@app.get("/api/accounts")
+def get_accounts():
+    """双账户对比: 模拟盘 + 实盘。"""
+    paper_resp = get_account(mode="paper")
+    live_resp = _live_account_view()
+    paper = json.loads(paper_resp.body) if hasattr(paper_resp, "body") else paper_resp
+    live = json.loads(live_resp.body) if hasattr(live_resp, "body") else live_resp
+    return JSONResponse({
+        "paper": paper,
+        "live": live,
+        "server_time": datetime.now().isoformat(),
+    })
+
+
 @app.get("/api/system/status")
 def get_system_status():
     session = market_session()
+    fund_ready = bool((config.get('fund.cust_id', '') or '').strip())
+    guling_token = str(config.get('broker.guling_agent_token', '') or '').strip()
     return JSONResponse({
+        "modes": ["paper", "live"],
         "mode": "paper",
         "mode_label": "A股模拟盘",
         "broker": "SimulatedBroker",
+        "live": {
+            "fund_ready": fund_ready,
+            "stock_ready": bool(guling_token),
+        },
         "market_session": session.code,
         "market_session_label": session.label,
         "market_open": session.is_open,

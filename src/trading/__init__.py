@@ -4,6 +4,7 @@
 子模块:
   fund_trader.py   爱基金交易客户端 (同花顺爱基金 HTTP API)
   stock_trader.py  股票实盘交易 (guling-trader MCP → 同花顺 xiadan.exe)
+  portfolio.py     实盘账户聚合视图 (基金+股票统一快照)
 
 命令行入口:  python trade.py ...   (项目根目录)
 
@@ -16,10 +17,13 @@ API 入口:    frontend/api_server.py 的 /api/fund/* 与 /api/live/* 端点
 """
 from .fund_trader import FundTrader, FundTraderError
 from .stock_trader import StockTrader, StockTraderError
+from .portfolio import get_live_snapshot, format_live_account
 
 __all__ = [
     "FundTrader",
     "FundTraderError",
     "StockTrader",
     "StockTraderError",
+    "get_live_snapshot",
+    "format_live_account",
 ]

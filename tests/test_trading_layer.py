@@ -94,6 +94,30 @@ class TestLiveApiEndpoints:
         assert r.status_code == 200
         assert "connected" in r.json().get("data", {})
 
+    def test_account_default_paper(self):
+        r = self._client().get("/api/account")
+        assert r.json().get("mode") == "paper"
+
+    def test_account_mode_live(self):
+        r = self._client().get("/api/account?mode=live")
+        body = r.json()
+        assert body.get("mode") == "live"
+        assert "fund" in body and "stock" in body
+
+    def test_accounts_dual(self):
+        r = self._client().get("/api/accounts")
+        d = r.json()
+        assert "paper" in d and "live" in d
+        assert d["paper"].get("mode") == "paper"
+        assert d["live"].get("mode") == "live"
+
+    def test_system_status_dual_modes(self):
+        r = self._client().get("/api/system/status")
+        d = r.json()
+        assert "paper" in d.get("modes", [])
+        assert "live" in d.get("modes", [])
+        assert "live" in d and "fund_ready" in d["live"]
+
     def test_live_order_blocked_without_auto_trade(self):
         r = self._client().post(
             "/api/live/order",

@@ -410,6 +410,20 @@ print(results.head())
 
 项目内置完整交易层 `src/trading/`，通过 CLI 和 HTTP API 直接完成真实交易。
 
+### 双账户体系
+
+系统支持**模拟盘 + 实盘**双账户并行：
+
+| 账户 | 交易对象 | 资金 | 入口 |
+|------|---------|------|------|
+| 模拟盘 (paper) | A 股虚拟交易 | 虚拟资金 (默认 100 万) | 交易页下单 / `/api/order` |
+| 实盘 (live) | 基金(爱基金) + 股票(同花顺) | 真实资金 | `trade.py` / `/api/fund/*` `/api/live/*` |
+
+- 模拟盘：FastBroker 虚拟撮合，可随意练习，风控规则与实盘一致
+- 实盘：真实扣款/真实持仓，受 `trading.auto_trade` 门禁与交互确认保护
+- 前端设置页「当前账户」可切换查看两个账户；`/api/accounts` 返回双账户对比
+- `GET /api/account?mode=paper|live` 指定模式；默认 paper 兼容旧版
+
 ### 前置准备
 
 ```bash
