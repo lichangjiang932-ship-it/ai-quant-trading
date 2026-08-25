@@ -37,6 +37,12 @@
 - **新闻情感**: 多源 + 情感评分 + 行业排名 + 龙虎榜
 - **市场监控**: 涨跌停告警、异常波动监控
 
+### 策略研究增强 (2026-08)
+- **新闻涨幅因子引擎** (`src/news/news_factor.py`): 每日自动抓取热点新闻（新浪7x24 / 华尔街见闻 / 东财 / 新浪财经）→ A股事件词典情绪打分 → 0-100 因子分 (bull/bear/neutral)。已接入自托管买入筛选器：强利好加分、重大利空否决、消息兑现日(涨幅≥5%)防追高
+- **巨型 IPO 上市日避险守卫** (`src/news/ipo_guard.py`): 13 个历史巨型 IPO 事件研究证实上市日沪深300平均 -0.98%（69% 下跌）；上市日 T 及 T+1 自动禁止新开仓
+- **消息反应速度事件研究** (`news_anticipation_backtest.py`): 11736 个交易日样本证实"价格提前反应"——大涨次日开盘买入持有 1 日 -0.34% 胜率仅 40%，追消息接盘
+- **收盘复盘** (`/api/review`): 收盘后自动统计当日成交与盈亏，按盈亏提炼策略建议供实盘参考
+
 ---
 
 ## 个人落地建议
@@ -164,10 +170,19 @@ python frontend/api_server.py
 ├── main_news.py               # 新闻驱动交易平台
 ├── start.py                   # 快速启动脚本
 ├── dashboard.py               # Web 监控面板 (Streamlit)
+├── ipo_drain_backtest.py       # 巨型IPO上市日事件研究回测 (13个历史事件)
+├── news_anticipation_backtest.py # 消息反应速度事件研究回测 (11736交易日样本)
 ├── config/                    # 配置文件
 │   ├── config.example.yaml   # 配置模板
 │   └── config.yaml           # 默认配置
 ├── src/
+│   ├── news/                  # 新闻模块
+│   │   ├── news_fetcher.py   # 多源新闻抓取 (新浪7x24/华尔街见闻/东财/新浪/财联社)
+│   │   ├── news_analyzer.py  # 新闻分析器
+│   │   ├── news_factor.py    # ★ 新闻涨幅因子引擎 (事件词典→0-100因子分)
+│   │   ├── ipo_guard.py      # ★ 巨型IPO上市日避险守卫
+│   │   └── sentiment/        # 情感分析
+│   ├── research/              # ★ 股票研究 (速览卡/可比估值/事件情景)
 │   ├── data/                  # 数据模块
 │   │   ├── market_data.py    # 历史数据
 │   │   ├── data_loader.py    # 技术指标
@@ -476,6 +491,11 @@ python trade.py stock connect                 # 测试 guling-trader 连接
 | `GET /api/live/status` | 股票账户 + 持仓 + 委托 |
 | `POST /api/live/order` | 股票下单 `{symbol, side, quantity, price?}` |
 | `POST /api/live/cancel` | 股票撤单 `{entrust_no}` |
+| `GET /api/news/factors` | 当日新闻涨幅因子（热点新闻→涉及个股 0-100 因子分） |
+| `POST /api/news/factors/refresh` | 强制刷新当日新闻因子 |
+| `GET /api/ipo/guard` | 巨型 IPO 上市日避险守卫状态（今日是否上市/未来 14 天预警） |
+| `GET /api/review?date=` | 收盘复盘报告（当日成交/盈亏/策略建议） |
+| `POST /api/review/generate` | 手动生成收盘复盘 |
 
 ### 安全机制
 
@@ -538,7 +558,7 @@ print(c.get_stats())
 python -m pytest tests/ -v
 ```
 
-测试覆盖: 策略 (5) / 风控 (11) / TP/SL (10) / 组合分析 (20) / 通知 (8) / 引擎 (7) / WebSocket (21)。共 86 用例。
+测试覆盖: 策略 / 风控 / TP/SL / 组合分析 / 通知 / 引擎 / WebSocket / 研究模块 / 新闻因子。共 200 用例。
 
 ## 开发计划
 
@@ -554,7 +574,10 @@ python -m pytest tests/ -v
 - [x] 投资组合分析 (夏普 / Sortino / Calmar / VaR)
 - [x] 通知系统 (Telegram / 钉钉 / 微信 / Webhook)
 - [x] WebSocket 重连 + 数据校验
-- [x] 单元测试 86 用例
+- [x] 单元测试 200 用例
+- [x] 新闻涨幅因子引擎 + 巨型IPO上市日避险守卫
+- [x] 收盘复盘 (成交/盈亏/策略建议自动生成)
+- [x] 消息反应速度事件研究 (价格提前反应实证)
 - [ ] 更多券商 (恒生 / 华泰)
 - [ ] 移动端推送
 - [ ] 多账户管理
