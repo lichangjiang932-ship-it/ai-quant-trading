@@ -62,6 +62,36 @@ def get_live_snapshot(
         fund_rows = holdings.get("fundList") or []
         fund_value = sum(float(r.get("totalAmount") or 0) for r in fund_rows)
         wallet = holdings.get("wallet") or {}
+
+        # 钱包持仓 (货币基金等, 如圆信永丰丰润货币B) — 不在 fundList 但属于持仓
+        wallet_position = None
+        if isinstance(wallet, dict) and wallet.get("fundCode"):
+            # 总份额 = 可用份额 + 冻结份额 (freezeMoney 字段也是份额单位)
+            w_avail = float(wallet.get("avaiableVol") or 0)
+            w_freeze = float(wallet.get("freezeMoney") or 0)
+            w_total_share = w_avail + w_freeze
+            # 如果 bankAccountShareList 有值, 取它作为权威值 (避免重复)
+            ba_list = wallet.get("bankAccountShareList") or []
+            if ba_list:
+                w_total_share = sum(float(ba.get("totalShare") or 0) for ba in ba_list)
+            if w_total_share > 0:
+                w_income = float(wallet.get("holdProfits") or 0)
+                w_name = str(wallet.get("fundName", "") or "")
+                w_code = str(wallet.get("fundCode", "") or "")
+                wallet_position = {
+                    "fundCode": w_code,
+                    "fundName": w_name,
+                    "holdVol": w_total_share,
+                    "totalAmount": round(w_total_share, 4),  # 货币基金净值≈1
+                    "holdIncome": w_income,
+                    "avgCost": 0,
+                    "netValue": 1.0,
+                    "positionType": "wallet",
+                }
+                fund_rows.append(wallet_position)
+                # 钱包持仓计入 fund 总额 (货币基金按净值 1 计算市值)
+                fund_value += float(wallet_position["totalAmount"])
+
         wallet_value = 0.0
         if isinstance(wallet, dict):
             wallet_value = float(wallet.get("totalValue") or wallet.get("sumValue") or 0)
@@ -71,11 +101,15 @@ def get_live_snapshot(
             "wallet_value": wallet_value,
             "holdings": fund_rows[:max_fund_holdings],
             "count": len(fund_rows),
+            "wallet_position": wallet_position,
             "error": "",
         }
-        result["cash"] += wallet_value
+        # 全部基金市值计入 (fund_value 已含钱包货币基金)
         result["market_value"] += fund_value
-        result["total_assets"] += fund_value + wallet_value
+        result["total_assets"] += fund_value
+        # 钱包现金余额
+        result["cash"] += wallet_value
+        result["total_assets"] += wallet_value
     except FundNotInitializedError as e:
         result["fund"]["error"] = str(e)
         result["warnings"].append("基金: 凭证未初始化")
@@ -131,7 +165,8 @@ def format_live_account(snap: Dict) -> str:
             vol = r.get("holdVol", r.get("totalAmount", 0))
             value = r.get("totalAmount", 0) or 0
             income = r.get("holdIncome", 0) or 0
-            lines.append(f"  {name}({code}) 份额={vol} 市值={value} 收益={income}")
+            tag = " [钱包]" if r.get("positionType") == "wallet" else ""
+            lines.append(f"  {name}({code}) 份额={vol} 市值={value} 收益={income}{tag}")
         if fund.get("wallet_value"):
             lines.append(f"  钱包资产: {fund.get('wallet_value', 0):.2f} 元")
     elif fund.get("error"):

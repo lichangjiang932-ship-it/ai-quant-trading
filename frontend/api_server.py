@@ -64,9 +64,13 @@ FRONTEND_DIR = os.path.join(ROOT_DIR, "frontend")
 
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI):
-    global _premarket_scheduler_task
+    global _premarket_scheduler_task, _autotrade_task, _news_factor_task
     if bool(config.get('premarket.scheduler_enabled', True)) and _premarket_scheduler_task is None:
         _premarket_scheduler_task = asyncio.create_task(_premarket_scheduler_loop())
+    if _autotrade_task is None:
+        _autotrade_task = asyncio.create_task(_autotrade_loop())
+    if _news_factor_task is None:
+        _news_factor_task = asyncio.create_task(_news_factor_loop())
     _ensure_strategy_refresh('potential')
     try:
         yield
@@ -78,6 +82,20 @@ async def _app_lifespan(_app: FastAPI):
             except asyncio.CancelledError:
                 pass
             _premarket_scheduler_task = None
+        if _autotrade_task is not None:
+            _autotrade_task.cancel()
+            try:
+                await _autotrade_task
+            except asyncio.CancelledError:
+                pass
+            _autotrade_task = None
+        if _news_factor_task is not None:
+            _news_factor_task.cancel()
+            try:
+                await _news_factor_task
+            except asyncio.CancelledError:
+                pass
+            _news_factor_task = None
 
 
 app = FastAPI(title="AI量化交易平台API", version="3.0", lifespan=_app_lifespan)
@@ -254,6 +272,22 @@ _premarket_scheduler_state = {'generation_date': '', 'execution_date': ''}
 _approval_lock = threading.RLock()
 _stored_approval_log = state_manager.load_account_state('trade_approval_log', []) or []
 _approval_log = _stored_approval_log if isinstance(_stored_approval_log, list) else []
+# ── 虚拟盘自托管 AI 自动交易 ──
+_autotrade_lock = threading.RLock()
+_autotrade_exec_lock = threading.Lock()  # 防重入: 一轮分析只能同时跑一次
+_stored_autotrade_state = state_manager.load_account_state('autotrade_state', {}) or {}
+_autotrade_state = {
+    "enabled": bool((_stored_autotrade_state or {}).get('enabled', False)),  # 开关 (仅虚拟盘生效, 持久化)
+    "started_at": str((_stored_autotrade_state or {}).get('started_at', '')),
+    "last_cycle": str((_stored_autotrade_state or {}).get('last_cycle', '')),
+    "cycles": int((_stored_autotrade_state or {}).get('cycles', 0) or 0),
+    "trades": list((_stored_autotrade_state or {}).get('trades', []) or []),  # 最近成交 (持久化, 复盘依赖)
+    "log": [],                 # 最近日志 (最多 80)
+    "error": "",
+    "mode": "paper",
+}
+_autotrade_task: Optional[asyncio.Task] = None
+_news_factor_task: Optional[asyncio.Task] = None
 _validation_lock = threading.RLock()
 _validation_cache: Dict[tuple, tuple] = {}
 _dashboard_signal_lock = threading.RLock()
@@ -2151,6 +2185,140 @@ def _live_account_view():
         })
 
 
+def _live_positions() -> list:
+    """实盘持仓列表, 兼容前端 positions 渲染格式。
+
+    将基金持仓 + 股票持仓统一转换为前端 renderPositions() 能识别的格式。
+    """
+    from src.trading import get_live_snapshot
+
+    snap = get_live_snapshot(config_path=CONFIG_PATH)
+    positions = []
+
+    # ---- 基金持仓 ----
+    fund = snap.get("fund") or {}
+    for r in (fund.get("holdings") or []):
+        code = str(r.get("fundCode", "") or "")
+        name = str(r.get("fundName", "") or "")
+        shares = float(r.get("holdVol", 0) or 0)
+        value = float(r.get("totalAmount", 0) or 0)
+        income = float(r.get("holdIncome", 0) or 0)
+        nav = float(r.get("netValue", 0) or 0)
+        cost = (value - income) / shares if shares > 0 else 0
+        pnl_pct = (income / (value - income) * 100) if (value - income) > 0 else 0
+        positions.append({
+            "symbol": code,
+            "name": name,
+            "quantity": shares,
+            "available_quantity": shares,
+            "avg_cost": round(cost, 4),
+            "last_price": nav,
+            "market_value": round(value, 2),
+            "unrealized_pnl": round(income, 2),
+            "unrealized_pnl_pct": round(pnl_pct, 2),
+            "position_type": "fund",
+        })
+
+    # ---- 股票持仓 ----
+    stock = snap.get("stock") or {}
+    for p in (stock.get("positions") or []):
+        sym = str(p.get("symbol", "") or "")
+        qty = int(p.get("quantity", 0) or 0)
+        avg_cost = float(p.get("avg_cost", 0) or 0)
+        last = float(p.get("last_price", 0) or 0)
+        mv = float(p.get("market_value", 0) or (qty * last))
+        pnl = float(p.get("unrealized_pnl", 0) or 0)
+        pnl_pct = float(p.get("unrealized_pnl_pct", 0) or 0)
+        positions.append({
+            "symbol": sym,
+            "name": str(p.get("name", "") or ""),
+            "quantity": qty,
+            "available_quantity": int(p.get("available_quantity", qty) or 0),
+            "avg_cost": round(avg_cost, 3),
+            "last_price": last,
+            "market_value": round(mv, 2),
+            "unrealized_pnl": round(pnl, 2),
+            "unrealized_pnl_pct": round(pnl_pct, 2),
+            "position_type": "stock",
+        })
+
+    return positions
+
+
+def _live_orders() -> list:
+    """实盘订单列表, 兼容前端 orders 渲染格式。
+
+    将基金交易记录 + 股票委托记录统一转换为前端 renderOrders() 能识别的格式。
+    """
+    orders = []
+
+    # ---- 基金交易记录 ----
+    try:
+        cust_id = str(config.get("fund.cust_id", "") or "")
+        if cust_id:
+            rows = _fund_trader().get_order_list(cust_id, limit=20)
+            from src.trading.fund_trader import FundTrader
+            for r in rows:
+                st = FundTrader.judge_order_status(r)
+                orders.append({
+                    "symbol": str(r.get("fundCode", "") or ""),
+                    "direction": str(r.get("tradeType", "") or "").lower(),
+                    "quantity": float(r.get("confirmVol", r.get("applyVol", 0)) or 0),
+                    "price": float(r.get("confirmNav", r.get("applyNav", 0)) or 0),
+                    "filled_price": float(r.get("confirmNav", r.get("applyNav", 0)) or 0),
+                    "filled_quantity": float(r.get("confirmVol", 0) or 0),
+                    "status": st.get("label", str(r.get("orderStatus", "") or "")),
+                    "created_at": str(r.get("applyDate", r.get("orderDate", "")) or ""),
+                    "updated_at": str(r.get("confirmDate", r.get("applyDate", "")) or ""),
+                    "order_type": "fund",
+                })
+    except Exception:
+        pass
+
+    # ---- 股票委托记录 ----
+    try:
+        trader = _stock_trader()
+        snap = trader.snapshot()
+        for e in (snap.get("entrusts") or []):
+            orders.append({
+                "symbol": str(e.get("symbol", "") or ""),
+                "direction": "sell" if str(e.get("direction", "")).lower() in ("sell", "卖出") else "buy",
+                "quantity": int(e.get("quantity", 0) or 0),
+                "price": float(e.get("price", 0) or 0),
+                "filled_price": float(e.get("filled_price", e.get("price", 0)) or 0),
+                "filled_quantity": int(e.get("filled_quantity", 0) or 0),
+                "status": str(e.get("status", "") or ""),
+                "created_at": str(e.get("time", "") or ""),
+                "updated_at": str(e.get("time", "") or ""),
+                "order_type": "stock",
+            })
+    except Exception:
+        pass
+
+    return orders
+
+
+def _live_risk() -> dict:
+    """实盘风险摘要 (精简版, 实盘无模拟风控限制)。"""
+    from src.trading import get_live_snapshot
+    snap = get_live_snapshot(config_path=CONFIG_PATH)
+    total = float(snap.get("total_assets", 0) or 0)
+    mv = float(snap.get("market_value", 0) or 0)
+    return {
+        "total_position_pct": (mv / total) if total > 0 else 0,
+        "drawdown": 0,
+        "daily_order_count": 0,
+        "limits": {"max_total_position": 1.0, "max_drawdown": 1.0, "max_orders_per_day": 999},
+        "total_asset": total,
+        "cash": float(snap.get("cash", 0) or 0),
+        "market_value": mv,
+        "cash_pct": (float(snap.get("cash", 0)) / total) if total > 0 else 0,
+        "position_count": len(snap.get("positions", [])),
+        "positions": _live_positions(),
+        "mode": "live",
+    }
+
+
 @app.get("/api/accounts")
 def get_accounts():
     """双账户对比: 模拟盘 + 实盘。"""
@@ -2193,8 +2361,11 @@ def get_system_status():
     })
 
 
-def _stream_snapshot(extra_symbols: Optional[List[str]] = None) -> Dict:
-    """把页面需要的轻量数据合成一帧，供 SSE 与降级轮询共用。"""
+def _stream_snapshot(extra_symbols: Optional[List[str]] = None, mode: str = "paper") -> Dict:
+    """把页面需要的轻量数据合成一帧，供 SSE 与降级轮询共用。
+
+    mode: paper=模拟盘(默认) | live=实盘(基金+股票聚合)
+    """
     session = market_session()
     quotes = {}
     watch = _get_watchlist()
@@ -2214,6 +2385,75 @@ def _stream_snapshot(extra_symbols: Optional[List[str]] = None) -> Dict:
     except Exception as exc:  # 行情源抖动不应中断整条流
         quotes = {}
         quote_error = str(exc)
+
+    # ── 实盘模式: account/positions/orders/risk 走实盘聚合, quotes/system 不变 ──
+    if mode.lower() == "live":
+        try:
+            live_acct_raw = _live_account_view()
+            live_acct = json.loads(live_acct_raw.body) if hasattr(live_acct_raw, "body") else live_acct_raw
+            live_positions = _live_positions()
+            live_orders = _live_orders()
+            total = float(live_acct.get("total_asset", 0) or 0)
+            mv = float(live_acct.get("market_value", 0) or 0)
+            live_risk = {
+                "total_position_pct": (mv / total) if total > 0 else 0,
+                "drawdown": 0,
+                "daily_order_count": 0,
+                "limits": {"max_total_position": 1.0, "max_drawdown": 1.0, "max_orders_per_day": 999},
+                "total_asset": total,
+                "cash": float(live_acct.get("cash", 0) or 0),
+                "market_value": mv,
+                "cash_pct": (float(live_acct.get("cash", 0)) / total) if total > 0 else 0,
+                "position_count": len(live_positions),
+                "positions": live_positions,
+                "mode": "live",
+            }
+            return {
+                "quotes": quotes,
+                "watchlist": watch,
+                "account": {
+                    "total_asset": total,
+                    "initial_capital": 0,
+                    "cash": float(live_acct.get("cash", 0) or 0),
+                    "profit": float(live_acct.get("profit", 0) or 0),
+                    "profit_pct": float(live_acct.get("profit_pct", 0) or 0),
+                    "market_value": mv,
+                    "positions": len(live_positions),
+                    "mode": "live",
+                    "fund": live_acct.get("fund"),
+                    "stock": live_acct.get("stock"),
+                    "warnings": live_acct.get("warnings", []),
+                    "opening_enabled": True,
+                },
+                "positions": live_positions,
+                "orders": live_orders,
+                "risk": live_risk,
+                "system": {
+                    "mode": "live",
+                    "mode_label": "实盘账户",
+                    "market_session": session.code,
+                    "market_session_label": session.label,
+                    "market_open": session.is_open,
+                    "opening_enabled": True,
+                    "enforce_market_hours": False,
+                    "t_plus_one": True,
+                    "buy_lot_size": 100,
+                    "state_persistence": False,
+                    "approval_gate": True,
+                    "server_time": datetime.now().isoformat(),
+                },
+                "server_time": datetime.now().isoformat(),
+            }
+        except Exception as exc:
+            # 实盘聚合失败 → 返回空壳, 不阻塞行情
+            return {
+                "quotes": quotes, "watchlist": watch,
+                "account": {"total_asset": 0, "cash": 0, "market_value": 0, "profit": 0, "mode": "live", "error": str(exc)},
+                "positions": [], "orders": [],
+                "risk": {"total_position_pct": 0, "mode": "live", "error": str(exc)},
+                "system": {"mode": "live", "mode_label": "实盘账户", "market_open": session.is_open, "market_session_label": session.label, "opening_enabled": True, "enforce_market_hours": False, "server_time": datetime.now().isoformat()},
+                "server_time": datetime.now().isoformat(),
+            }
 
     # 行情先写入模拟券商，再计算资产、持仓和风控，避免快照出现一帧延迟。
     try:
@@ -2267,7 +2507,7 @@ def _stream_snapshot(extra_symbols: Optional[List[str]] = None) -> Dict:
             "mode": "paper",
             "opening_enabled": bool(_trading_control.get('opening_enabled', True)),
         },
-        "positions": [p.to_dict() for p in snap["positions"]],
+        "positions": _paper_positions_with_names(),
         "orders": orders,
         "risk": report,
         "system": {
@@ -2289,10 +2529,11 @@ def _stream_snapshot(extra_symbols: Optional[List[str]] = None) -> Dict:
 
 
 @app.get("/api/stream")
-async def stream_updates(symbol: Optional[str] = Query(None)):
+async def stream_updates(symbol: Optional[str] = Query(None), mode: str = Query("paper")):
     """SSE 增量推送：交易时段 3s，休市 30s；内容无变化时只发心跳。
 
     取代前端过去的多组 setInterval 全量轮询，避免整页重建导致的闪烁。
+    mode: paper=模拟盘 | live=实盘 (live 模式降低推送频率, 实盘数据不需 3s 刷新)
     """
     async def event_source():
         last_digest = None
@@ -2301,7 +2542,7 @@ async def stream_updates(symbol: Optional[str] = Query(None)):
         while True:
             try:
                 extras = [symbol] if symbol else []
-                payload = await asyncio.to_thread(_stream_snapshot, extras)
+                payload = await asyncio.to_thread(_stream_snapshot, extras, mode)
                 body = json.dumps(payload, ensure_ascii=False, default=str)
                 # server_time 每帧都会变化，不应因此触发整帧重绘。
                 comparable = dict(payload)
@@ -2323,7 +2564,9 @@ async def stream_updates(symbol: Optional[str] = Query(None)):
                 err = json.dumps({"error": str(exc)}, ensure_ascii=False)
                 yield f"event: stream-error\ndata: {err}\n\n"
                 open_now = False
-            await asyncio.sleep(3 if open_now else 30)
+            # 实盘模式降低频率: 交易时段 10s, 休市 60s (实盘数据无需 3s 刷新)
+            is_live = mode.lower() == "live"
+            await asyncio.sleep((10 if is_live else 3) if open_now else (60 if is_live else 30))
 
     return StreamingResponse(
         event_source(),
@@ -2337,11 +2580,14 @@ async def stream_updates(symbol: Optional[str] = Query(None)):
 
 
 @app.get("/api/snapshot")
-async def get_dashboard_snapshot(symbol: Optional[str] = Query(None)):
-    """SSE 不可用时的单请求快照，也供用户手动刷新使用。"""
+async def get_dashboard_snapshot(symbol: Optional[str] = Query(None), mode: str = Query("paper")):
+    """SSE 不可用时的单请求快照，也供用户手动刷新使用。
+
+    mode: paper=模拟盘(默认) | live=实盘
+    """
     extras = [symbol] if symbol else []
     try:
-        payload = await asyncio.to_thread(_stream_snapshot, extras)
+        payload = await asyncio.to_thread(_stream_snapshot, extras, mode)
         return JSONResponse(payload, headers={"Cache-Control": "no-store"})
     except Exception as exc:
         import traceback
@@ -3290,15 +3536,50 @@ def ai_pick_execute(body: dict):
     return JSONResponse(payload)
 
 
+def _paper_positions_with_names() -> List[Dict]:
+    """模拟盘持仓 + 中文名称 (行情 → 常用表)。"""
+    positions = [p.to_dict() for p in broker.get_positions()]
+    try:
+        syms = [p.get("symbol") for p in positions if p.get("symbol")]
+        if syms:
+            qmap = realtime.get_quotes(syms, sources=['tencent', 'sina', 'eastmoney']) or {}
+            for p in positions:
+                sym = p.get("symbol", "")
+                p["name"] = (
+                    (qmap.get(sym) or {}).get("name")
+                    or COMMON_SYMBOL_NAMES.get(sym, "")
+                    or p.get("name", "")
+                )
+    except Exception:
+        pass
+    return positions
+
+
 @app.get("/api/positions")
-def get_positions():
-    """获取模拟账户持仓。"""
-    return JSONResponse([p.to_dict() for p in broker.get_positions()])
+def get_positions(mode: str = Query("paper")):
+    """获取持仓列表。
+
+    mode: paper=模拟盘(默认) | live=实盘(基金+股票)
+    """
+    if mode.lower() == "live":
+        try:
+            return JSONResponse(_live_positions())
+        except Exception as e:
+            return JSONResponse([])
+    return JSONResponse(_paper_positions_with_names())
 
 
 @app.get("/api/orders")
-def get_orders():
-    """获取模拟账户订单历史。"""
+def get_orders(mode: str = Query("paper")):
+    """获取订单历史。
+
+    mode: paper=模拟盘(默认) | live=实盘(基金+股票)
+    """
+    if mode.lower() == "live":
+        try:
+            return JSONResponse(_live_orders())
+        except Exception as e:
+            return JSONResponse([])
     df = broker.get_order_history()
     if df.empty:
         return JSONResponse([])
@@ -3530,8 +3811,16 @@ def search_symbols(q: str = Query("")):
 
 
 @app.get("/api/risk")
-def get_risk():
-    """返回当前模拟账户的风险摘要。"""
+def get_risk(mode: str = Query("paper")):
+    """返回风险摘要。
+
+    mode: paper=模拟盘(默认) | live=实盘(精简版)
+    """
+    if mode.lower() == "live":
+        try:
+            return JSONResponse(_live_risk())
+        except Exception:
+            return JSONResponse({"total_position_pct": 0, "drawdown": 0, "daily_order_count": 0, "limits": {}, "mode": "live"})
     snap = _portfolio_snapshot()
     report = risk_mgr.get_risk_report()
     report.update({
@@ -3541,7 +3830,7 @@ def get_risk():
         "total_position_pct": snap["total_position_pct"],
         "cash_pct": snap["cash"] / max(snap["total_asset"], 1),
         "position_count": len(snap["positions"]),
-        "positions": [p.to_dict() for p in snap["positions"]],
+        "positions": _paper_positions_with_names(),
     })
     return JSONResponse(report)
 
@@ -3610,6 +3899,105 @@ def get_capital(symbol: str = Query("sh600000")):
         "direction": summary.get("direction", ""),
         "summary": text,
     })
+
+
+# ===========================================================================
+# 股票研究端点 — 速览卡 / 可比估值 / 事件情景 (src.research)
+# ===========================================================================
+
+@app.get("/api/research/tearsheet")
+def research_tearsheet(symbol: str = Query("sh600000")):
+    """公司速览卡: 行情/估值/技术面/买卖区间/综合评级。"""
+    symbol = _normalize_symbol(symbol)
+    try:
+        from src.research import build_tearsheet
+    except ImportError:
+        return JSONResponse({"success": False, "error": "研究模块未安装"})
+    quote = realtime.get_quotes([symbol], sources=['tencent', 'sina', 'eastmoney']).get(symbol, {}) or {}
+    history = _load_daily_frame(symbol, 240)
+    if history.empty or 'Close' not in history.columns:
+        return JSONResponse({"success": False, "error": "暂无K线数据，无法生成速览卡"})
+    closes = [float(v) for v in history['Close'].tolist() if float(v) > 0]
+    volumes = [float(v) for v in history.get('Volume', []).tolist()] if 'Volume' in history.columns else None
+    snap = _portfolio_snapshot()
+    benchmark_symbol = _normalize_symbol(str(config.get('professional.benchmark_symbol', 'sh000001')))
+    regime = professional_decision.market_regime(_load_daily_frame(benchmark_symbol, 240)).to_dict()
+    signal = _deterministic_trade_signal(symbol, quote, snap, history, regime)
+    capital = None
+    try:
+        summary = _get_capital_fetcher().get_main_net_summary(symbol)
+        if summary:
+            capital = {"main_net": summary.get("total_main_net", 0), "direction": summary.get("direction", "")}
+    except Exception:
+        pass
+    session = market_session()
+    tearsheet = build_tearsheet(
+        symbol=symbol,
+        name=quote.get('name') or COMMON_SYMBOL_NAMES.get(symbol, symbol),
+        quote=quote,
+        closes=closes,
+        volumes=volumes,
+        signal=signal,
+        capital=capital,
+        market_session=session.label,
+    )
+    return JSONResponse({"success": True, "tearsheet": tearsheet})
+
+
+@app.get("/api/research/comps")
+def research_comps(symbol: str = Query("sh600000")):
+    """可比公司估值: 同业 PE/PB 对比 + 相对贵贱结论。"""
+    symbol = _normalize_symbol(symbol)
+    try:
+        from src.research import compute_comps, classify_industry
+    except ImportError:
+        return JSONResponse({"success": False, "error": "研究模块未安装"})
+    industry = classify_industry(symbol)
+    peers = [symbol]
+    if industry:
+        from src.research.comps import INDUSTRY_PEERS
+        peers = list(dict.fromkeys([symbol] + INDUSTRY_PEERS.get(industry, [])))
+    quotes = realtime.get_quotes(peers, sources=['tencent', 'sina', 'eastmoney']) or {}
+    result = compute_comps(symbol, industry, quotes)
+    if not result["peer_count"]:
+        result["conclusion"]["notes"] = ["该股未纳入内置行业池，可手动补充同业代码对比"]
+    return JSONResponse({"success": True, "comps": result})
+
+
+@app.post("/api/research/scenario")
+def research_scenario(body: dict):
+    """事件情景分析: 业绩/放量/破位/政策等事件的 what-if 价格区间。"""
+    symbol = _normalize_symbol(str(body.get('symbol', 'sh600000')))
+    event = str(body.get('event', 'custom'))
+    custom_impact = None
+    try:
+        custom_impact = float(body.get('custom_impact')) if body.get('custom_impact') is not None else None
+    except (TypeError, ValueError):
+        custom_impact = None
+    try:
+        from src.research import build_scenario
+    except ImportError:
+        return JSONResponse({"success": False, "error": "研究模块未安装"})
+    quote = realtime.get_quotes([symbol], sources=['tencent', 'sina', 'eastmoney']).get(symbol, {}) or {}
+    price = float(quote.get('price', 0) or 0)
+    if price <= 0:
+        return JSONResponse({"success": False, "error": "暂无行情价格"})
+    history = _load_daily_frame(symbol, 120)
+    volatility = None
+    if not history.empty and 'Close' in history.columns:
+        closes = [float(v) for v in history['Close'].tolist() if float(v) > 0]
+        if len(closes) > 5:
+            import numpy as _np
+            returns = _np.diff(_np.log(_np.array(closes[-60:]) + 1e-12))
+            volatility = round(float(returns.std()) * _np.sqrt(252) * 100, 1)
+    name = quote.get('name') or COMMON_SYMBOL_NAMES.get(symbol, symbol)
+    result = build_scenario(
+        symbol=symbol, name=name, price=price, event=event,
+        volatility_pct=volatility, custom_impact=custom_impact,
+        daily_range={"high": quote.get('high'), "low": quote.get('low'),
+                     "pre_close": quote.get('pre_close')},
+    )
+    return JSONResponse({"success": True, "scenario": result})
 
 
 @app.get("/api/market_sentiment")
@@ -4127,6 +4515,1060 @@ async def _premarket_scheduler_loop():
 
 
 # ===========================================================================
+# 虚拟盘自托管 AI 自动交易 (仅模拟盘, 赚取收益为第一目标, 数据供实盘参考)
+# ===========================================================================
+
+# 内置活跃候选池: 覆盖主流行业龙头, 保证自托管每轮都有"未持仓"的买入标的
+AUTOTRADE_CANDIDATES: List[str] = [
+    "sh600519",  # 贵州茅台  白酒
+    "sz000858",  # 五粮液    白酒
+    "sh600809",  # 山西汾酒  白酒
+    "sz300750",  # 宁德时代  新能源
+    "sz002594",  # 比亚迪    新能源车
+    "sz002460",  # 赣锋锂业  锂电
+    "sz300274",  # 阳光电源  光伏
+    "sh601012",  # 隆基绿能  光伏
+    "sh688981",  # 中芯国际  半导体
+    "sz002371",  # 北方华创  半导体
+    "sz300661",  # 圣邦股份  半导体
+    "sh600276",  # 恒瑞医药  医药
+    "sz300760",  # 迈瑞医疗  医疗器械
+    "sh603259",  # 药明康德  CXO
+    "sz300059",  # 东方财富  券商
+    "sh600030",  # 中信证券  券商
+    "sh601318",  # 中国平安  保险
+    "sh600036",  # 招商银行  银行
+    "sz002475",  # 立讯精密  消费电子
+    "sz002241",  # 歌尔股份  消费电子
+    "sh603501",  # 韦尔股份  半导体设计
+    "sz000977",  # 浪潮信息  AI算力
+    "sh688041",  # 海光信息  AI芯片
+    "sz002230",  # 科大讯飞  AI应用
+    "sz300308",  # 中际旭创  CPO
+    "sh601899",  # 紫金矿业  有色
+    "sh600000",  # 浦发银行  银行
+    "sz000001",  # 平安银行  银行
+    "sh600104",  # 上汽集团  整车
+    "sz000002",  # 万科A     地产
+]
+
+
+def _autotrade_candidate_pool() -> List[str]:
+    """候选池 = 当前持仓 + 内置活跃池 + 自选股 + AI选股结果, 去重取前 16。
+
+    关键修复: 必须包含未持仓的新股票, 否则买入分支永远没有标的。
+    """
+    syms: List[str] = []
+    held: set = set()
+    try:
+        for p in broker.get_positions():
+            s = getattr(p, 'symbol', '')
+            if s:
+                held.add(s)
+                if s not in syms:
+                    syms.append(s)
+    except Exception:
+        pass
+    # 未持仓候选: 内置活跃池 + 自选股 + 最近 AI 选股结果
+    extra = list(AUTOTRADE_CANDIDATES) + list(_get_watchlist() or [])
+    try:
+        with _scan_lock:
+            for pick in (_scan_job.get("picks") or []):
+                s = _normalize_symbol(str(pick.get("symbol", "")))
+                if s:
+                    extra.append(s)
+    except Exception:
+        pass
+    for s in extra:
+        s = _normalize_symbol(s)
+        if s and s not in held and s not in syms:
+            syms.append(s)
+    return syms[:16]
+
+
+def _autotrade_log(msg: str, kind: str = "info"):
+    """写入自托管日志 (带时间戳, 最多保留 80 条)。"""
+    with _autotrade_lock:
+        _autotrade_state["log"].append({
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "msg": msg,
+            "kind": kind,
+        })
+        _autotrade_state["log"] = _autotrade_state["log"][-80:]
+
+
+def _autotrade_record_trade(entry: Dict):
+    """记录一笔自动交易 (最多保留 50 条, 持久化供复盘)。"""
+    with _autotrade_lock:
+        _autotrade_state["trades"].insert(0, {
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "symbol": entry.get("symbol", ""),
+            "name": entry.get("name", ""),
+            "side": entry.get("side", "buy"),
+            "quantity": entry.get("quantity", 0),
+            "price": round(float(entry.get("price", 0) or 0), 2),
+            "reason": entry.get("reason", "")[:120],
+            "order_id": entry.get("order_id", ""),
+        })
+        _autotrade_state["trades"] = _autotrade_state["trades"][:50]
+        try:
+            state_manager.save_account_state('autotrade_state', {
+                "enabled": _autotrade_state.get('enabled', False),
+                "started_at": _autotrade_state.get('started_at', ''),
+                "last_cycle": _autotrade_state.get('last_cycle', ''),
+                "cycles": _autotrade_state.get('cycles', 0),
+                "trades": _autotrade_state.get('trades', []),
+            })
+        except Exception:
+            pass
+
+
+def _autotrade_batch_signals(symbols: List[str], quotes: Dict, snap: Dict, regime: Dict) -> Dict:
+    """对候选池全量跑确定性信号 (不走 _build_rule_ai_signals 的 6 只截断)。"""
+    symbols = [s for s in symbols if s]
+    if not symbols:
+        return {}
+    with _Pool(max_workers=min(4, len(symbols))) as executor:
+        frames = list(executor.map(lambda s: _load_daily_frame(s, 240), symbols))
+    return {
+        s: _deterministic_trade_signal(s, quotes.get(s, {}), snap, f, regime)
+        for s, f in zip(symbols, frames)
+    }
+
+
+def _autotrade_buy_screen(symbol: str, opp: Dict, dq: Dict, regime: Dict,
+                          quote: Dict, history: pd.DataFrame,
+                          validation: Dict, capital: Optional[Dict],
+                          cfg: Dict, news_factor: Optional[Dict] = None) -> Dict:
+    """买入分析器 — 硬门槛 + 分层评分 (严格但不死板, 营利为第一目标)。
+
+    硬门槛 (全过才买, 防止乱买):
+      1. 市场环境允许开仓 + 数据质量合格
+      2. 机会评分 ≥ buy_score (60) + 置信度 ≥ 0.55 + 风险回报比 ≥ 1.5
+      3. 至少弱趋势 (价格接近或站上 MA20, 或 MA5 接近/超过 MA20)
+      4. 主力资金未巨量净流出 (> 成交额 20% 才否决)
+
+    新闻涨幅因子 (加分/否决):
+      - bull 且因子分 ≥ 70 → 综合分 +10 (强催化)
+      - bull 且 55~70 → 综合分 +4
+      - bear 且因子分 ≤ 35 → 否决 (重大利空不碰)
+      - bear 35~45 → 综合分 -6
+      - neutral / 无新闻 → 不影响
+
+    分层加分 (决定买谁):
+      - 强趋势 (+8) / 弱趋势 (+2)
+      - 资金净流入 (+6) / 小幅流出 (-4)
+      - 历史胜率: 样本≥10 且 ≥50% (+6); 样本≥10 且 25~40% (-8);
+        样本<10 不否决 (统计意义不足, 不再一票否决)
+    """
+    price = float(quote.get('price', 0) or 0)
+    score = float(opp.get('score', 0) or 0)
+    conf = float(opp.get('confidence', 0) or 0)
+    rr = float(opp.get('risk_reward', 0) or 0)
+    factors: Dict = {}
+    reject: List[str] = []
+
+    # 1. 市场环境
+    allow_new = bool(regime.get('allow_new_positions', True))
+    factors['regime'] = regime.get('code', 'unknown')
+    if not allow_new:
+        reject.append(f"市场环境防守 ({regime.get('label', '')})，暂停开仓")
+
+    # 2. 数据质量
+    dq_ok = bool(dq.get('allowed'))
+    factors['data_quality'] = dq.get('status', '')
+    if not dq_ok:
+        reject.append(f"数据质量未通过 ({dq.get('status', '')})")
+
+    # 3. 评分/置信度/风险回报比 (硬门槛)
+    buy_score = float(cfg.get('buy_score', 60) or 60)
+    min_conf = float(cfg.get('min_confidence', 0.55) or 0.55)
+    min_rr = float(cfg.get('min_risk_reward', 1.5) or 1.5)
+    factors['score'] = round(score, 1)
+    factors['confidence'] = round(conf, 2)
+    factors['risk_reward'] = round(rr, 2)
+    if score < buy_score:
+        reject.append(f"机会评分 {score:.0f} < {buy_score:.0f}")
+    if conf < min_conf:
+        reject.append(f"置信度 {conf:.2f} < {min_conf:.2f}")
+    if rr < min_rr:
+        reject.append(f"风险回报比 {rr:.1f} < {min_rr:.1f}")
+
+    # 4. 趋势确认 (分层: 强趋势/弱趋势可买, 无趋势否决)
+    trend_strength = 0  # 0=无 1=弱 2=强
+    if not history.empty and 'Close' in history.columns and len(history) >= 25:
+        closes = [float(v) for v in history['Close'].tolist() if float(v) > 0]
+        if len(closes) >= 25:
+            import numpy as _np
+            ma5 = float(_np.mean(closes[-5:]))
+            ma20 = float(_np.mean(closes[-20:]))
+            factors['ma5'] = round(ma5, 2)
+            factors['ma20'] = round(ma20, 2)
+            if price > ma20 and ma5 >= ma20:
+                trend_strength = 2
+            elif price > ma20 * 0.985 or ma5 > ma20 * 0.985:
+                trend_strength = 1  # 接近站上/接近金叉, 允许参与
+            else:
+                reject.append(f"趋势未确认 (价 {price:.2f} vs MA20 {ma20:.2f}, MA5 {ma5:.2f} vs MA20 {ma20:.2f})")
+    else:
+        reject.append("K线数据不足，无法确认趋势")
+
+    # 5. 资金流 (按成交额比例判断 — 大盘股绝对流出额大但不代表资金出逃)
+    flow_ok = True
+    if capital:
+        main_net = float(capital.get('main_net', 0) or 0)
+        factors['main_net'] = round(main_net, 0)
+        factors['flow_direction'] = capital.get('direction', '')
+        # 用当日成交额比例: 主力净流出 > 成交额 20% 视为巨量出逃 (否决)
+        amount = float(quote.get('amount', 0) or 0)
+        if amount > 0:
+            flow_ratio = main_net / amount
+            factors['flow_ratio'] = round(flow_ratio, 3)
+            if main_net < -0.20 * amount:
+                flow_ok = False
+                reject.append(f"主力净流出占成交额 {abs(flow_ratio)*100:.0f}% (出逃)")
+        else:
+            # 无成交额数据: 兜底用总资产 3% (3.3万), 避免绝对额误杀大盘股
+            if main_net < -0.03 * float(cfg.get('total_asset', 1e6) or 1e6):
+                flow_ok = False
+                reject.append(f"主力资金大幅净流出 ({abs(main_net)/1e4:.0f}万)")
+    else:
+        factors['flow_direction'] = 'unknown'
+
+    # 6. 历史验证 (软约束: 样本充足且极差才否决, 样本少不否决)
+    win_rate = float((validation or {}).get('win_rate', 0) or 0)
+    samples = int((validation or {}).get('samples', 0) or 0)
+    factors['win_rate'] = round(win_rate, 1)
+    factors['samples'] = samples
+    if samples >= 10 and win_rate < 25:
+        reject.append(f"历史相似机会胜率 {win_rate:.0f}% (样本{samples})，模式明显不利")
+
+    # 7. 新闻涨幅因子 (加分/否决)
+    if news_factor:
+        nf_dir = str(news_factor.get('direction', ''))
+        nf_score = float(news_factor.get('factor_score', 0) or 0)
+        factors['news_direction'] = nf_dir
+        factors['news_factor'] = round(nf_score, 1)
+        factors['news_events'] = news_factor.get('events', [])[:3]
+        if nf_dir == 'bear' and nf_score <= 35:
+            reject.append(f"新闻重大利空 (因子{nf_score:.0f}: {'/'.join(factors['news_events'])})")
+
+    # 综合分 (排序用)
+    comp = score * conf
+    if news_factor:
+        nf_dir = news_factor.get('direction', '')
+        nf_score = float(news_factor.get('factor_score', 0) or 0)
+        # 防追高: 消息兑现日往往已大涨(价格提前反应), 追买接盘(回测: 大涨次日开盘买胜率仅40%)
+        chg = float(quote.get('change_pct', 0) or 0)
+        if nf_dir == 'bull':
+            if chg >= 3.0:
+                factors['news_chase'] = True
+                if chg >= 5.0:
+                    reject.append(f"新闻利好但当日已大涨 {chg:.1f}% (消息已兑现), 追高风险")
+                # 3~5% 不加分不否决, 等回调
+            elif nf_score >= 70:
+                comp += 10
+            else:
+                comp += 4
+        elif nf_dir == 'bear' and nf_score > 35:
+            comp -= 6
+    if trend_strength == 2:
+        comp += 8
+    elif trend_strength == 1:
+        comp += 2
+    if capital and float(capital.get('main_net', 0) or 0) > 0:
+        comp += 6
+    elif capital and float(capital.get('main_net', 0) or 0) < 0:
+        comp -= 4
+    if samples >= 10 and win_rate >= 50:
+        comp += 6
+    elif samples >= 10 and win_rate < 40:
+        comp -= 8
+    if rr >= 2.0:
+        comp += 4
+
+    passed = not reject and price > 0
+    return {
+        "pass": passed,
+        "score": round(comp, 1),
+        "factors": factors,
+        "reject": reject[:5],
+    }
+
+
+def _autotrade_cycle():
+    """一轮自动交易: AI 选股 → 按资金买入 → 持仓止损/止盈卖出。全部模拟盘。
+
+    买入规则 (自托管宽松版, 以赚取收益为第一目标):
+      - 未持仓 + 机会评分 ≥ buy_score(默认60) + 置信度 ≥ min_confidence(默认0.5)
+      - 数据质量合格 + 市场环境允许开仓 + 风险回报比 ≥ 1.2
+      - 不卡历史相似机会验证 (样本少/胜率低不再一票否决)
+    卖出规则: 复用确定性信号的止损/止盈/退出计划。
+    """
+    # 防重入: toggle 立即触发 + 循环周期可能并发, 同一轮只能跑一次
+    if not _autotrade_exec_lock.acquire(blocking=False):
+        _autotrade_log("上一轮分析仍在进行，跳过本轮", "muted")
+        return
+    try:
+        return _autotrade_cycle_impl()
+    finally:
+        _autotrade_exec_lock.release()
+
+
+def _autotrade_cycle_impl():
+    now = datetime.now()
+    session = market_session()
+    # 非交易时段不自动交易 (模拟盘可练习, 但自动交易遵守市场时段避免误导)
+    if not session.is_open:
+        _autotrade_log(f"非交易时段 ({session.label})，跳过本轮", "muted")
+        return
+    if not bool(_trading_control.get('opening_enabled', True)):
+        _autotrade_log("开仓已锁定，跳过本轮", "warn")
+        return
+
+    symbols = _autotrade_candidate_pool()
+    if not symbols:
+        _autotrade_log("候选池为空，跳过本轮", "muted")
+        return
+
+    try:
+        quotes = realtime.get_quotes(symbols, sources=['eastmoney', 'tencent', 'sina']) or {}
+        snap = _portfolio_snapshot()
+        benchmark_symbol = _normalize_symbol(str(config.get('professional.benchmark_symbol', 'sh000001')))
+        regime = professional_decision.market_regime(_load_daily_frame(benchmark_symbol, 240)).to_dict()
+
+        # 自托管配置 (config.yaml autotrade 段, 均有默认值)
+        max_positions = int(config.get('autotrade.max_positions', 6) or 6)
+        buy_score = float(config.get('autotrade.buy_score', 60) or 60)
+        min_conf = float(config.get('autotrade.min_confidence', 0.5) or 0.5)
+        # 仓位不做上限 (营利第一): 目标仓位 = 100%, 现金充裕就持续买入优质标的
+        target_pos_pct = 1.0
+        min_keep = int(config.get('autotrade.min_keep_positions', 2) or 2)
+        min_rr = float(config.get('autotrade.min_risk_reward', 1.2) or 1.2)
+
+        positions = broker.get_positions()
+        held = {getattr(p, 'symbol', '') for p in positions}
+        total_asset = float(snap['total_asset'] or 0)
+        cash = float(snap['cash'] or 0)
+        current_pos_pct = float(snap['market_value']) / max(total_asset, 1)
+        # 剩余可用空间 = 现金比例 (仓位不设上限)
+        room = max(cash / max(total_asset, 1), 0.0)
+
+        # 单笔预算: 按总资产比例, 现金越充足单笔上限越高 (分散风险, 不做总仓位限制)
+        budget_pct = min(max(0.2, room * 0.45), 0.35)
+        if room < 0.02:
+            _autotrade_log(f"可用现金仅 {money_cn(cash)}，暂缓买入，仅做持仓管理", "muted")
+
+        bought, sold = [], []
+
+        # === ① 卖出处理 (持仓): 复用确定性信号 (止损/止盈/退出计划) ===
+        held_syms = [s for s in symbols if s in held]
+        if held_syms:
+            sigs_map = _autotrade_batch_signals(held_syms, quotes, snap, regime)
+            for symbol, sig in sigs_map.items():
+                if sig.get('action') != 'sell':
+                    continue
+                pos = snap['pos_map'].get(symbol)
+                if not pos:
+                    continue
+                price = float(sig.get('price', 0) or 0)
+                quote = quotes.get(symbol, {})
+                name = quote.get('name') or COMMON_SYMBOL_NAMES.get(symbol, symbol)
+                confidence = float(sig.get('confidence', 0) or 0)
+                reason = str(sig.get('reason', ''))
+                # 持仓数保护: 持仓太少时只执行止损, 暂缓止盈, 保住底仓
+                if len(positions) <= min_keep and not any(k in reason for k in ('止损', '回撤', '破位')):
+                    _autotrade_log(f"持仓仅 {len(positions)} 只(保护线 {min_keep})，暂缓止盈 {name}({symbol})", "muted")
+                    continue
+                avail = int(getattr(pos, 'available_quantity', 0) or 0)
+                suggested = int(sig.get('suggested_qty', 0) or 0) or avail
+                suggested = min(suggested, avail)
+                if suggested <= 0:
+                    continue
+                try:
+                    resp = place_order({
+                        "symbol": symbol, "side": "sell", "quantity": suggested, "price": price,
+                        "reason": "autotrade_ai_sell",
+                        "client_order_id": f"auto-{now.strftime('%Y%m%d%H%M%S')}-{symbol}-sell",
+                    })
+                    payload = json.loads(resp.body.decode('utf-8'))
+                    if payload.get('success'):
+                        _autotrade_record_trade({
+                            "symbol": symbol, "name": name, "side": "sell",
+                            "quantity": suggested, "price": price,
+                            "reason": f"AI信号 {confidence:.0%} | {reason[:60]}",
+                            "order_id": payload.get('order_id', ''),
+                        })
+                        sold.append(symbol)
+                        _autotrade_log(f"AI自动卖出 {name}({symbol}) {suggested}股 @{price:.2f}", "sell")
+                    else:
+                        _autotrade_log(f"卖出 {symbol} 被拒: {payload.get('error', '')[:60]}", "warn")
+                except Exception as e:
+                    _autotrade_log(f"卖出 {symbol} 异常: {e}", "err")
+
+        # === ② 买入处理 (未持仓): 严格多因子分析, 评分排序优先买最优的 ===
+        # 巨型 IPO 上市日避险: 上市日(T)及次日(T+1)禁止新开仓 (资金虹吸回测依据)
+        ipo_guard_hit = None
+        try:
+            from src.news.ipo_guard import is_giant_ipo_day
+            ipo_guard_hit = is_giant_ipo_day(now.date())
+            if ipo_guard_hit is None:
+                ipo_guard_hit = is_giant_ipo_day(now.date() - timedelta(days=1))
+                if ipo_guard_hit is not None:
+                    ipo_guard_hit["_t_plus_1"] = True
+        except Exception:
+            ipo_guard_hit = None
+        if ipo_guard_hit is not None:
+            _autotrade_log(
+                f"巨型IPO {ipo_guard_hit.get('name','')} 上市日避险: "
+                f"回测沪深300当日平均-0.98%, 本轮禁止新开仓 "
+                f"({ipo_guard_hit.get('date')}, {ipo_guard_hit.get('note','')})",
+                "warn",
+            )
+        if room > 0.05 and len(positions) < max_positions and ipo_guard_hit is None:
+            buy_pool = [s for s in symbols if s not in held]
+            candidates = []
+            target_date = target_trading_date(now, _premarket_holidays())
+            screen_cfg = {
+                "buy_score": buy_score, "min_confidence": min_conf,
+                "min_risk_reward": min_rr, "total_asset": total_asset,
+            }
+            # 当日新闻涨幅因子 (单次拉取, 供所有候选使用)
+            try:
+                from src.news.news_factor import get_daily_factors
+                news_map = {}
+                for nf in get_daily_factors().get("factors", []):
+                    news_map[nf["symbol"]] = nf
+            except Exception:
+                news_map = {}
+            for symbol in buy_pool:
+                try:
+                    history = _load_daily_frame(symbol, 240)
+                    if history.empty or 'Close' not in history.columns:
+                        continue
+                    opp = opportunity_scorer.analyze(
+                        symbol, history,
+                        equity=total_asset, cash=snap['cash'],
+                        current_symbol_value=0,
+                        quote=quotes.get(symbol, {}),
+                    ).to_dict()
+                    dq = professional_decision.data_quality(history, target_date, _premarket_holidays()).to_dict()
+                    validation = _cached_opportunity_validation(symbol, history)
+                    capital = None
+                    try:
+                        cap_summary = _get_capital_fetcher().get_main_net_summary(symbol)
+                        if cap_summary:
+                            capital = {"main_net": cap_summary.get("total_main_net", 0),
+                                       "direction": cap_summary.get("direction", "")}
+                    except Exception:
+                        pass
+                    screen = _autotrade_buy_screen(
+                        symbol, opp, dq, regime, quotes.get(symbol, {}),
+                        history, validation, capital, screen_cfg,
+                        news_factor=news_map.get(symbol),
+                    )
+                    if screen["pass"]:
+                        candidates.append((symbol, opp, screen))
+                    else:
+                        name = (quotes.get(symbol, {}) or {}).get('name') or COMMON_SYMBOL_NAMES.get(symbol, symbol)
+                        _autotrade_log(
+                            f"分析 {name}({symbol}): 未通过 — {'; '.join(screen['reject'][:3]) or '条件不足'}",
+                            "muted",
+                        )
+                except Exception:
+                    continue
+            # 按综合分排序, 优先买分析最强的
+            candidates.sort(key=lambda x: x[2]["score"], reverse=True)
+            # 剩余可加仓金额: 每笔买入后实时扣减, 累计不超过目标仓位
+            room_amount = room * total_asset
+            for symbol, opp, screen in candidates:
+                if len(positions) + len(bought) >= max_positions:
+                    break
+                if room_amount <= 500:
+                    break
+                price = float(opp.get('price', 0) or 0)
+                quote = quotes.get(symbol, {})
+                name = quote.get('name') or COMMON_SYMBOL_NAMES.get(symbol, symbol)
+                suggested = int(opp.get('suggested_qty', 0) or 0)
+                budget = min(budget_pct * total_asset, room_amount)
+                max_by_budget = int(budget / price / 100) * 100 if price > 0 else 0
+                qty = min(suggested, max_by_budget) if suggested > 0 else max_by_budget
+                qty = max(qty // 100 * 100, 0)
+                if qty <= 0:
+                    _autotrade_log(f"{symbol} 预算不足 (可用 ¥{budget:.0f})，跳过", "muted")
+                    continue
+                reason = str(opp.get('reasons', []) or [])
+                f = screen.get("factors", {})
+                news_part = ""
+                if f.get('news_direction'):
+                    news_part = (f" 新闻{f.get('news_factor')}({f.get('news_direction')})"
+                                 f"{('/'+'/'.join(f.get('news_events',[]))) if f.get('news_events') else ''}")
+                try:
+                    resp = place_order({
+                        "symbol": symbol, "side": "buy", "quantity": qty, "price": price,
+                        "reason": "autotrade_ai_buy",
+                        "client_order_id": f"auto-{now.strftime('%Y%m%d%H%M%S')}-{symbol}-buy",
+                    })
+                    payload = json.loads(resp.body.decode('utf-8'))
+                    if payload.get('success'):
+                        _autotrade_record_trade({
+                            "symbol": symbol, "name": name, "side": "buy",
+                            "quantity": qty, "price": price,
+                            "reason": (f"评分{f.get('score')} 置信度{f.get('confidence')} "
+                                       f"胜率{f.get('win_rate')}% 资金{'净流入' if f.get('flow_direction')=='inflow' else f.get('flow_direction','')}{news_part} | {reason[:35]}"),
+                            "order_id": payload.get('order_id', ''),
+                        })
+                        bought.append(symbol)
+                        room_amount -= qty * price
+                        _autotrade_log(
+                            f"AI买入 {name}({symbol}) {qty}股 @{price:.2f} | "
+                            f"评分{f.get('score')} 置信度{f.get('confidence')} 胜率{f.get('win_rate')}%{news_part}",
+                            "buy",
+                        )
+                    else:
+                        _autotrade_log(f"买入 {symbol} 被拒: {payload.get('error', '')[:60]}", "warn")
+                except Exception as e:
+                    _autotrade_log(f"买入 {symbol} 异常: {e}", "err")
+
+        with _autotrade_lock:
+            _autotrade_state['cycles'] += 1
+            _autotrade_state['last_cycle'] = now.strftime("%H:%M:%S")
+        summary = f"第 {_autotrade_state['cycles']} 轮完成 · 仓位 {current_pos_pct * 100:.0f}%"
+        if bought:
+            summary += f" · 买入 {len(bought)} 只"
+        if sold:
+            summary += f" · 卖出 {len(sold)} 只"
+        _autotrade_log(summary, "ok")
+    except Exception as exc:
+        with _autotrade_lock:
+            _autotrade_state['error'] = str(exc)
+        _autotrade_log(f"本轮异常: {exc}", "err")
+
+
+async def _autotrade_loop():
+    """自托管循环: 开启时按周期执行, 未开启时低频巡检开关。"""
+    _last_review_date = ""
+    while True:
+        try:
+            enabled = False
+            with _autotrade_lock:
+                enabled = bool(_autotrade_state.get('enabled'))
+            if enabled:
+                await asyncio.to_thread(_autotrade_cycle)
+            # 收盘后自动生成当日复盘 (15:05 之后, 每天一次)
+            try:
+                now_dt = datetime.now()
+                today = now_dt.date().isoformat()
+                session = market_session()
+                if (
+                    datetime_time(15, 5) <= now_dt.time() <= datetime_time(23, 59)
+                    and _last_review_date != today
+                    and not session.is_open
+                ):
+                    _last_review_date = today
+                    await asyncio.to_thread(_build_daily_review, today)
+            except Exception:
+                pass
+            # 交易时段 3 分钟一轮, 非交易时段 60 秒巡检开关即可
+            await asyncio.sleep(180 if enabled else 60)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await asyncio.sleep(60)
+
+
+# ===========================================================================
+# 收盘复盘 — 记录模拟盘当日成交, 按盈亏提炼策略供实盘参考
+# ===========================================================================
+
+REVIEW_DIR = os.path.join(ROOT_DIR, "output", "review")
+_review_save_lock = threading.Lock()  # 复盘文件写入互斥 (防并发线程互相锁文件)
+
+
+def _save_review_report(path: str, payload: str) -> bool:
+    """健壮保存复盘报告: 加锁 + 临时文件原子替换 + 多重降级。
+
+    Windows 下目标文件被读取/扫描时 os.replace 会 WinError 5, 逐级降级:
+      1. 写 .tmp → os.replace
+      2. replace 失败 → 删除目标再 replace
+      3. 仍失败 → 直接写目标文件 (放弃原子性)
+      4. 全部失败 → 重试 5 次后放弃
+    """
+    with _review_save_lock:
+        os.makedirs(REVIEW_DIR, exist_ok=True)
+        tmp_path = path + ".tmp"
+        for attempt in range(5):
+            # 1. 写临时文件
+            try:
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    f.write(payload)
+            except OSError:
+                time.sleep(0.4)
+                continue
+            # 2. 原子替换 (目标被占用时降级)
+            try:
+                os.replace(tmp_path, path)
+                return True
+            except OSError:
+                try:
+                    os.remove(path)
+                    os.replace(tmp_path, path)
+                    return True
+                except OSError:
+                    pass
+            # 3. 兜底: 直接写目标
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(payload)
+                return True
+            except OSError:
+                time.sleep(0.4)
+        return False
+
+
+def _cleanup_review_tmp():
+    """清理复盘目录残留的 .tmp 临时文件。"""
+    try:
+        if os.path.isdir(REVIEW_DIR):
+            for name in os.listdir(REVIEW_DIR):
+                if name.endswith(".tmp"):
+                    try:
+                        os.remove(os.path.join(REVIEW_DIR, name))
+                    except OSError:
+                        pass
+    except Exception:
+        pass
+
+
+def _review_pnl_of_trades(symbol: str, trades: List[Dict]) -> Dict:
+    """对单只股票当日成交做盈亏统计。
+
+    返回: {buy_qty, buy_amount, sell_qty, sell_amount, realized_pnl}
+    已实现盈亏优先用订单自带 realized_pnl (broker 按真实持仓成本计算);
+    缺省时按 (卖出价 - 当日加权买入成本) 兜底配对。
+    """
+    # 关键修复: 必须按 symbol 过滤, 否则会把别的股票订单混入配对
+    mine = [t for t in trades if t.get('symbol') == symbol]
+    buys = [t for t in mine if t.get('side') == 'buy' and t.get('status') in ('filled', 'FILLED')]
+    sells = [t for t in mine if t.get('side') == 'sell' and t.get('status') in ('filled', 'FILLED')]
+    buy_qty = sum(int(t.get('filled_quantity') or t.get('quantity') or 0) for t in buys)
+    buy_amount = sum(float(t.get('filled_price') or t.get('price') or 0) * int(t.get('filled_quantity') or t.get('quantity') or 0) for t in buys)
+    avg_cost = buy_amount / buy_qty if buy_qty > 0 else 0.0
+    sell_qty = 0
+    sell_amount = 0.0
+    realized = 0.0
+    for t in sells:
+        qty = int(t.get('filled_quantity') or t.get('quantity') or 0)
+        px = float(t.get('filled_price') or t.get('price') or 0)
+        sell_qty += qty
+        sell_amount += px * qty
+        # 优先用 broker 已算好的 realized_pnl (真实持仓成本)
+        if t.get('realized_pnl') is not None:
+            realized += float(t.get('realized_pnl') or 0)
+        elif avg_cost > 0:
+            realized += (px - avg_cost) * qty
+    return {
+        "buy_qty": buy_qty, "buy_amount": round(buy_amount, 2),
+        "sell_qty": sell_qty, "sell_amount": round(sell_amount, 2),
+        "avg_cost": round(avg_cost, 3),
+        "realized_pnl": round(realized, 2),
+    }
+
+
+def _extract_signal_info(reason: str) -> Dict:
+    """从自托管 reason 提取 评分/置信度/胜率 (用于信号质量分析)。"""
+    info = {}
+    try:
+        import re as _re
+        m = _re.search(r'评分(\d+)', reason or '')
+        if m:
+            info['score'] = int(m.group(1))
+        m = _re.search(r'置信度(\d+)%', reason or '')
+        if m:
+            info['confidence'] = int(m.group(1)) / 100.0
+        m = _re.search(r'胜率(\d+)%', reason or '')
+        if m:
+            info['win_rate'] = int(m.group(1))
+        m = _re.search(r'止盈|止损|破位|回撤', reason or '')
+        if m:
+            info['exit_type'] = m.group(0)
+    except Exception:
+        pass
+    return info
+
+
+def _build_daily_review(target_date: Optional[str] = None):
+    """生成模拟盘当日复盘: 成交记录 + 盈亏统计 + 策略提炼。
+
+    数据源: broker 订单历史(模拟盘) + 持仓浮盈 + 自托管成交记录。
+    报告持久化到 output/review/YYYY-MM-DD.json。
+    """
+    today = (target_date or datetime.now().date().isoformat())
+    try:
+        td = datetime.strptime(today, "%Y-%m-%d").date()
+    except ValueError:
+        td = datetime.now().date()
+        today = td.isoformat()
+
+    # 1. 当日订单 (模拟盘)
+    trades: List[Dict] = []
+    try:
+        df = broker.get_order_history()
+        if not df.empty:
+            for _, row in df.iterrows():
+                created = row.get('created_at')
+                if created is None:
+                    continue
+                cdate = created.date() if hasattr(created, 'date') else created
+                if str(cdate)[:10] != today:
+                    continue
+                status = str(row.get('status', ''))
+                if status.lower() not in ('filled', 'success'):
+                    continue
+                trades.append({
+                    "symbol": str(row.get('symbol', '')),
+                    "side": str(row.get('direction', row.get('side', ''))).lower(),
+                    "quantity": int(row.get('quantity', 0) or 0),
+                    "filled_quantity": int(row.get('filled_quantity', 0) or 0) or int(row.get('quantity', 0) or 0),
+                    "price": float(row.get('price', 0) or 0),
+                    "filled_price": float(row.get('filled_price', 0) or 0) or float(row.get('price', 0) or 0),
+                    "status": status,
+                    "time": str(created)[11:19] if hasattr(created, 'strftime') else str(created)[11:19],
+                    "realized_pnl": row.get('realized_pnl'),
+                })
+    except Exception as e:
+        _autotrade_log(f"复盘: 读取订单失败 {e}", "warn")
+
+    # 2. 自托管成交记录 (带信号 reason)
+    autotrade_trades = list(_autotrade_state.get('trades') or [])
+    auto_by_symbol = {}
+    for t in autotrade_trades:
+        sym = t.get('symbol', '')
+        if sym:
+            auto_by_symbol.setdefault(sym, []).append(t)
+
+    # 3. 当前持仓浮盈
+    positions = broker.get_positions()
+    pos_map = {getattr(p, 'symbol', ''): p for p in positions}
+    names = {}
+    for p in positions:
+        names[getattr(p, 'symbol', '')] = getattr(p, 'name', '') or COMMON_SYMBOL_NAMES.get(getattr(p, 'symbol', ''), getattr(p, 'symbol', ''))
+
+    # 4. 按股票汇总
+    by_symbol = {}
+    for t in trades:
+        sym = t['symbol']
+        if sym not in by_symbol:
+            by_symbol[sym] = _review_pnl_of_trades(sym, trades)
+            by_symbol[sym]['symbol'] = sym
+            by_symbol[sym]['name'] = names.get(sym, sym)
+            by_symbol[sym]['autotrade'] = auto_by_symbol.get(sym, [])
+    syms = sorted(by_symbol.keys())
+
+    # 5. 盈亏汇总
+    realized_total = sum(float(v.get('realized_pnl', 0) or 0) for v in by_symbol.values())
+    unrealized_total = 0.0
+    for sym in syms:
+        pos = pos_map.get(sym)
+        if pos:
+            unrealized_total += float(getattr(pos, 'unrealized_pnl', 0) or 0)
+    account = broker.get_account_info()
+    total_asset = float(account.get('total_asset', 0) or 0)
+    market_value = float(account.get('market_value', 0) or 0)
+
+    # 6. 策略提炼 (核心: 根据当天盈亏给出相对策略)
+    lessons: List[str] = []
+    strategies: List[Dict] = []
+    day_result = realized_total + unrealized_total
+    buy_count = sum(1 for t in trades if t['side'] == 'buy')
+    sell_count = sum(1 for t in trades if t['side'] == 'sell')
+
+    # 6.1 整体盈亏
+    if day_result >= 0:
+        lessons.append(f"当日盈亏 {money_cn(day_result)} (已实现 {money_cn(realized_total)} + 浮动 {money_cn(unrealized_total)})，盈利状态")
+    else:
+        lessons.append(f"当日盈亏 {money_cn(day_result)} (已实现 {money_cn(realized_total)} + 浮动 {money_cn(unrealized_total)})，亏损状态")
+    lessons.append(f"成交 {buy_count} 笔买入 / {sell_count} 笔卖出, 当前持仓 {len(positions)} 只, 仓位 {market_value / max(total_asset, 1) * 100:.0f}%")
+
+    # 6.2 买入信号质量 (浮盈比例)
+    buy_quality = []
+    for sym in syms:
+        auto = by_symbol[sym]['autotrade']
+        if not auto:
+            continue
+        pos = pos_map.get(sym)
+        if not pos:
+            continue
+        avg_cost = float(getattr(pos, 'avg_cost', 0) or 0)
+        last = float(getattr(pos, 'last_price', 0) or getattr(pos, 'market_value', 0) / max(getattr(pos, 'quantity', 1), 1))
+        ret = (last - avg_cost) / avg_cost * 100 if avg_cost > 0 else 0
+        info = _extract_signal_info(auto[0].get('reason', '')) if auto else {}
+        buy_quality.append({"symbol": sym, "name": by_symbol[sym]['name'], "return_pct": round(ret, 1), **info})
+    win_buys = [b for b in buy_quality if b['return_pct'] > 0]
+    if buy_quality and len(win_buys) / len(buy_quality) < 0.5:
+        strategies.append({
+            "title": "买入信号过松",
+            "priority": "高",
+            "content": f"当日买入 {len(buy_quality)} 只, 仅 {len(win_buys)} 只浮盈 ({len(win_buys) / len(buy_quality) * 100:.0f}%)。建议提高买入门槛: 评分+5 或 只买历史胜率≥45% 的标的。",
+        })
+    elif buy_quality and len(win_buys) / len(buy_quality) >= 0.7:
+        strategies.append({
+            "title": "买入信号有效",
+            "priority": "中",
+            "content": f"当日买入 {len(buy_quality)} 只, {len(win_buys)} 只浮盈 ({len(win_buys) / len(buy_quality) * 100:.0f}%)。可保持当前买入标准, 实盘参考该信号组合。",
+        })
+
+    # 6.3 卖出质量 (止损纪律 / 止盈落袋)
+    exit_types = {}
+    for sym in syms:
+        for t in by_symbol[sym]['autotrade']:
+            if t.get('side') == 'sell':
+                info = _extract_signal_info(t.get('reason', ''))
+                et = info.get('exit_type', '信号')
+                exit_types[et] = exit_types.get(et, 0) + 1
+    if exit_types.get('止损'):
+        strategies.append({
+            "title": "止损纪律",
+            "priority": "中",
+            "content": f"当日止损 {exit_types['止损']} 次。止损果断执行, 实盘务必保持同一纪律; 若止损频繁, 需检查买入时机是否追高。",
+        })
+    if exit_types.get('止盈'):
+        strategies.append({
+            "title": "止盈保护",
+            "priority": "中",
+            "content": f"当日止盈 {exit_types['止盈']} 次。若止盈后继续上涨, 实盘可改为分批止盈(如 50%+剩余跟踪)。",
+        })
+
+    # 6.4 仓位管理 (仓位不做上限, 只看现金充裕度提示建仓机会)
+    target_pct = 1.0
+    current_pct = market_value / max(total_asset, 1)
+    cash_pct = 1.0 - current_pct
+    if cash_pct > 0.5:
+        strategies.append({
+            "title": "现金充裕",
+            "priority": "低",
+            "content": f"当前仓位仅 {current_pct * 100:.0f}%，现金 {cash_pct * 100:.0f}%。以营利为第一目标, 实盘可关注通过严格分析(评分/趋势/资金)确认的标的适度建仓。",
+        })
+    elif current_pct > 0.95:
+        strategies.append({
+            "title": "近乎满仓",
+            "priority": "中",
+            "content": f"当前仓位 {current_pct * 100:.0f}% 已接近满仓。持仓集中度高, 实盘注意单票风险, 卖出后资金可再投入优质标的(仓位不做上限)。",
+        })
+
+    # 6.5 当日亏损复盘 (亏损必须有行动建议, 供实盘参考)
+    if day_result < 0:
+        strategies.append({
+            "title": "当日亏损复盘",
+            "priority": "高",
+            "content": (f"当日亏损 {money_cn(abs(day_result))} (已实现 {money_cn(abs(realized_total))})。"
+                       f"建议: ① 检查卖出时点 — 止损是否果断、止盈是否过晚; "
+                       f"② 若亏损来自买入后浮亏, 复盘买入信号是否追高; "
+                       f"③ 实盘对照当日策略, 避免重复同样错误。"),
+        })
+    elif day_result > 0 and realized_total > 0:
+        strategies.append({
+            "title": "盈利锁定",
+            "priority": "中",
+            "content": f"当日盈利 {money_cn(day_result)} 且已实现 {money_cn(realized_total)}。止盈纪律执行良好, 实盘保持; 注意防止回吐, 可分批止盈。",
+        })
+
+    # 6.6 默认兜底策略
+    if not strategies:
+        strategies.append({
+            "title": "维持当前策略",
+            "priority": "低",
+            "content": "当日信号与盈亏未显示明显偏差, 建议维持当前买入标准与仓位纪律。",
+        })
+
+    report = {
+        "date": today,
+        "generated_at": datetime.now().isoformat(),
+        "summary": {
+            "total_asset": round(total_asset, 2),
+            "market_value": round(market_value, 2),
+            "position_ratio": round(current_pct, 4),
+            "realized_pnl": round(realized_total, 2),
+            "unrealized_pnl": round(unrealized_total, 2),
+            "day_pnl": round(day_result, 2),
+            "buy_count": buy_count,
+            "sell_count": sell_count,
+            "position_count": len(positions),
+            "target_position_pct": target_pct,
+        },
+        "trades": trades,
+        "by_symbol": list(by_symbol.values()),
+        "lessons": lessons,
+        "strategies": strategies,
+    }
+    # 持久化 (加锁 + 原子写入 + 多重降级, 兼容 Windows 文件锁)
+    try:
+        path = os.path.join(REVIEW_DIR, f"{today}.json")
+        payload = json.dumps(report, ensure_ascii=False, indent=1)
+        if _save_review_report(path, payload):
+            with _autotrade_lock:
+                _autotrade_state['last_review'] = today
+        else:
+            _autotrade_log(f"复盘: 保存失败 (文件被占用), 报告仍在内存中可查询", "warn")
+    except Exception as e:
+        _autotrade_log(f"复盘: 保存失败 {e}", "warn")
+    _autotrade_log(f"收盘复盘已生成: {today} 当日盈亏 {money_cn(day_result)}", "ok")
+    return report
+
+
+def money_cn(v: float) -> str:
+    """金额中文显示 (万元)。"""
+    v = float(v or 0)
+    if abs(v) >= 1e8:
+        return f"{v/1e8:.2f}亿"
+    if abs(v) >= 1e4:
+        return f"{v/1e4:.1f}万"
+    return f"{v:.0f}元"
+
+
+@app.get("/api/news/factors")
+def news_factors():
+    """当日新闻涨幅因子: 热点新闻 → 涉及个股因子分 (供研究页/自托管参考)。"""
+    try:
+        from src.news.news_factor import get_daily_factors
+        data = get_daily_factors()
+        return JSONResponse({
+            "success": True,
+            "date": data.get("date", ""),
+            "news_count": data.get("news_count", 0),
+            "generated_at": data.get("generated_at", ""),
+            "factors": data.get("factors", []),
+        })
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)})
+
+
+@app.get("/api/ipo/guard")
+def ipo_guard():
+    """巨型 IPO 上市日避险守卫状态。"""
+    try:
+        from src.news.ipo_guard import ipo_guard_status
+        return JSONResponse({"success": True, **ipo_guard_status()})
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)})
+
+
+@app.post("/api/news/factors/refresh")
+def news_factors_refresh():
+    """强制刷新当日新闻因子。"""
+    try:
+        from src.news.news_factor import get_daily_factors
+        data = get_daily_factors(force=True)
+        return JSONResponse({"success": True, "news_count": data.get("news_count", 0),
+                             "factors": data.get("factors", [])})
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)})
+
+
+async def _news_factor_loop():
+    """每日新闻因子循环: 交易时段每 30 分钟抓取刷新 + 收盘后记录前瞻验证。"""
+    while True:
+        try:
+            from src.news.news_factor import get_daily_factors, factor_for_symbol
+            now_dt = datetime.now()
+            session = market_session()
+            if session.is_open:
+                # 盘中刷新热点因子
+                await asyncio.to_thread(get_daily_factors, True)
+            elif datetime_time(15, 5) <= now_dt.time() <= datetime_time(23, 59):
+                # 收盘后: 为持仓与候选记录前瞻验证快照 + 回填历史因子收益
+                try:
+                    from src.news.news_factor import record_validation, update_validation_returns
+                    factors = get_daily_factors().get("factors", [])
+                    for nf in factors[:30]:
+                        record_validation(nf["symbol"], nf["factor_score"], nf["direction"])
+                    update_validation_returns()
+                except Exception:
+                    pass
+            await asyncio.sleep(1800)  # 30 分钟
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await asyncio.sleep(300)
+
+
+@app.get("/api/review")
+def get_review(date: str = Query("")):
+    """获取收盘复盘报告 (默认今日, 可指定 YYYY-MM-DD)。"""
+    target = (date or datetime.now().date().isoformat())
+    path = os.path.join(REVIEW_DIR, f"{target}.json")
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return JSONResponse(json.load(f))
+        except Exception as e:
+            return JSONResponse({"success": False, "error": f"复盘文件损坏: {e}"})
+    # 未生成则现场生成
+    try:
+        report = _build_daily_review(target)
+        return JSONResponse(report)
+    except Exception as e:
+        return JSONResponse({"success": False, "error": f"复盘生成失败: {e}"})
+
+
+@app.post("/api/review/generate")
+def generate_review():
+    """手动触发收盘复盘。"""
+    try:
+        report = _build_daily_review(datetime.now().date().isoformat())
+        return JSONResponse({"success": True, "report": report})
+    except Exception as e:
+        return JSONResponse({"success": False, "error": f"复盘生成失败: {e}"})
+
+
+@app.get("/api/autotrade/status")
+def autotrade_status():
+    """自托管 AI 自动交易状态。"""
+    with _autotrade_lock:
+        st = dict(_autotrade_state)
+        st['log'] = list(_autotrade_state['log'])
+        st['trades'] = list(_autotrade_state['trades'])
+        st['config'] = {
+            "max_positions": int(config.get('autotrade.max_positions', 5) or 5),
+            "per_trade_budget_pct": float(config.get('autotrade.per_trade_budget_pct', 0.2) or 0.2),
+            "min_confidence": float(config.get('autotrade.min_confidence', 0.55) or 0.55),
+            "cycle_seconds": 180,
+        }
+    return JSONResponse(st)
+
+
+@app.post("/api/autotrade/toggle")
+def autotrade_toggle(body: dict):
+    """启停自托管 AI 自动交易 (仅虚拟盘)。body: {enabled: bool}"""
+    enabled = bool(body.get('enabled', False))
+    with _autotrade_lock:
+        _autotrade_state['enabled'] = enabled
+        if enabled and not _autotrade_state.get('started_at'):
+            _autotrade_state['started_at'] = datetime.now().isoformat()
+        if not enabled:
+            _autotrade_state['started_at'] = ''
+    _autotrade_log("自托管模式已开启 — AI 将自动选股买卖 (虚拟资金)" if enabled else "自托管模式已关闭", "ok" if enabled else "warn")
+    # 持久化开关状态 (重启后保持)
+    try:
+        state_manager.save_account_state('autotrade_state', {
+            "enabled": enabled,
+            "started_at": _autotrade_state.get('started_at', ''),
+            "last_cycle": _autotrade_state.get('last_cycle', ''),
+            "cycles": _autotrade_state.get('cycles', 0),
+        })
+    except Exception:
+        pass
+    # 开启后立即触发一轮, 不用等下一个巡检周期
+    if enabled:
+        try:
+            _threading.Thread(target=_autotrade_cycle, daemon=True).start()
+        except Exception:
+            pass
+    return JSONResponse({"success": True, "enabled": enabled})
+
+
+# ===========================================================================
 # 实盘交易端点 — 基金 (爱基金) & 股票 (guling-trader/同花顺)
 # 项目内直接完成真实交易, 不依赖 WorkBuddy。
 # ===========================================================================
@@ -4305,6 +5747,7 @@ def live_cancel(body: dict):
 
 
 def main():
+    _cleanup_review_tmp()  # 启动时清理复盘残留 .tmp
     port = config.get('server.port', 8080)
     host = config.get('server.host', '127.0.0.1')
     uvicorn.run(app, host=host, port=port, log_level="info")

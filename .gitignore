@@ -83,3 +83,10 @@ __pycache__/
 *.bak
 D:destokmoney.workbuddymemory/
 output/playwright/
+
+# === 运行产物与缓存 (不上传) ===
+output/
+data/news_factor_validation.csv
+data/news_symbol_map.json
+data/*.json
+data/*.csv

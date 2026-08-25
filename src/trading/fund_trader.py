@@ -204,12 +204,24 @@ class FundTrader:
                 raise
             except FundTraderError:
                 continue
-            rows = h.get("fundPositonDetailList") or h.get("fundList") or []
+            rows = (
+                h.get("fundPositonCombinedList")
+                or h.get("fundPositonDetailList")
+                or h.get("fundList")
+                or []
+            )
             for r in rows:
                 if r.get("combineFlag") == 1 or not any(
                     x.get("fundCode") == r.get("fundCode") for x in merged["fundList"]
                 ):
                     merged["fundList"].append(r)
+            # combined 列表里可能嵌套 detail, 兜底合并 (防字段名再次变动)
+            for r in rows:
+                for sub in (r.get("fundPositonDetailList") or []):
+                    if not any(
+                        x.get("fundCode") == sub.get("fundCode") for x in merged["fundList"]
+                    ):
+                        merged["fundList"].append(sub)
         try:
             merged["wallet"] = self.get_wallet_home()
         except FundNotInitializedError:

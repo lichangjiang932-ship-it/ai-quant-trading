@@ -8,14 +8,6 @@ agents:
   api_key_env: DEEPSEEK_API_KEY
   base_url: https://api.deepseek.com
   confidence_threshold: 0.6
-  decision_interval: 300
-  deep_think_model: deepseek-chat
-  enabled: false
-  max_debate_rounds: 1
-  provider: deepseek
-  quick_think_model: deepseek-chat
-  temperature: 0.3
-  use_memory: true
 ai:
   api_key_env: DEEPSEEK_API_KEY
   base_url: https://api.deepseek.com
@@ -43,21 +35,27 @@ approval:
   min_validation_samples: 3
   min_validation_win_rate: 45
   validation_cache_seconds: 1800
+autotrade:
+  buy_score: 60
+  decision_interval: 300
+  deep_think_model: deepseek-chat
+  enabled: false
+  max_debate_rounds: 1
+  max_positions: 6
+  min_confidence: 0.55
+  min_keep_positions: 2
+  min_risk_reward: 1.5
+  provider: deepseek
+  quick_think_model: deepseek-chat
+  target_position_pct: 1.0
+  temperature: 0.3
+  use_memory: true
 broker:
   account_id: ''
+  guling_agent_token: ''
+  guling_mcp_url: https://mcp.guling.pro
   mini_qmt_path: ''
   type: simulated
-  # === guling-trader (同花顺实盘) 配置 ===
-  # 使用前: 1) 下载 guling-trader.exe 运行并获取配对码
-  #         2) 用配对码换取 agent_token
-  #         3) 将 agent_token 填入下方
-  guling_agent_token: ''
-  guling_mcp_url: 'https://mcp.guling.pro'
-# === 爱基金 (基金实盘交易) ===
-# 凭证在 ~/.aijijin/credentials.json (由 aijijin-sdk init() 写入), 无需在此配置。
-# cust_id 可选: 首次申购后可从响应中获取, 填入后可直接查询交易记录。
-fund:
-  cust_id: '100126492181'
 capital:
   block_trade: true
   dividend: true
@@ -90,6 +88,8 @@ data_source:
   - sina
   tencent:
     enabled: true
+fund:
+  cust_id: '100126492181'
 logging:
   level: INFO
   log_dir: logs
