@@ -51,6 +51,14 @@ def load(symbol: str) -> pd.DataFrame:
     return out
 
 
+def bootstrap_ci(vals, n=1000, seed=42):
+    """重采样求均值 95% 置信区间 (借鉴 AgentQuant bootstrapped Sharpe 思路)。"""
+    rng = np.random.default_rng(seed)
+    arr = np.asarray(vals, dtype=float)
+    means = np.array([rng.choice(arr, size=len(arr), replace=True).mean() for _ in range(n)])
+    return float(np.percentile(means, 5)), float(np.percentile(means, 95))
+
+
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     print(f"=== 消息反应速度事件研究 | 标的池 {len(UNIVERSE)} 只 | 覆盖 2024-07~2026-08 ===")
@@ -90,9 +98,11 @@ def main():
         vals = [r[key] for r in rows if r[key] is not None]
         if not vals:
             return None
+        lo, hi = bootstrap_ci(vals)
         return {"n": len(vals), "avg": round(sum(vals)/len(vals), 2),
                 "med": round(sorted(vals)[len(vals)//2], 2),
-                "win": round(sum(1 for v in vals if v > 0)/len(vals)*100, 1)}
+                "win": round(sum(1 for v in vals if v > 0)/len(vals)*100, 1),
+                "ci95": [round(lo, 2), round(hi, 2)]}
 
     def show(label, rows):
         s1, s3, s5, s10 = (stats(rows, "ret_1"), stats(rows, "ret_3"),
@@ -101,7 +111,7 @@ def main():
             print(f"  {label}: 无样本")
             return
         print(f"  {label}: n={s1['n']}")
-        print(f"    持有1日 均{s1['avg']:+.2f}% 胜率{s1['win']:.0f}% | "
+        print(f"    持有1日 均{s1['avg']:+.2f}% [95%CI {s1['ci95'][0]:+.2f}~{s1['ci95'][1]:+.2f}] 胜率{s1['win']:.0f}% | "
               f"3日 均{s3['avg']:+.2f}% 胜率{s3['win']:.0f}% | "
               f"5日 均{s5['avg']:+.2f}% 胜率{s5['win']:.0f}% | "
               f"10日 均{s10['avg']:+.2f}% 胜率{s10['win']:.0f}%")

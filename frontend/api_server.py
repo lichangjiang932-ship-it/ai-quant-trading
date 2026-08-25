@@ -289,6 +289,8 @@ _autotrade_state = {
 _autotrade_task: Optional[asyncio.Task] = None
 _news_factor_task: Optional[asyncio.Task] = None
 _validation_lock = threading.RLock()
+_trading_counters = {"buy": 0, "sell": 0}  # 可观测性: 模拟盘累计成交笔数
+_trading_counter_lock = threading.Lock()
 _validation_cache: Dict[tuple, tuple] = {}
 _dashboard_signal_lock = threading.RLock()
 _stored_dashboard_signals = state_manager.load_account_state('dashboard_signals', {}) or {}
@@ -3688,6 +3690,8 @@ def place_order(body: dict):
             risk_mgr.update_daily_pnl(float(status.get('realized_pnl', 0) or 0))
         _persist_broker_state()
         _persist_risk_runtime()
+        with _trading_counter_lock:
+            _trading_counters[side] = _trading_counters.get(side, 0) + 1
         response = {
             "success": True,
             "order_id": order_id,
@@ -4640,7 +4644,8 @@ def _autotrade_batch_signals(symbols: List[str], quotes: Dict, snap: Dict, regim
 def _autotrade_buy_screen(symbol: str, opp: Dict, dq: Dict, regime: Dict,
                           quote: Dict, history: pd.DataFrame,
                           validation: Dict, capital: Optional[Dict],
-                          cfg: Dict, news_factor: Optional[Dict] = None) -> Dict:
+                          cfg: Dict, news_factor: Optional[Dict] = None,
+                          wyckoff: Optional[Dict] = None) -> Dict:
     """买入分析器 — 硬门槛 + 分层评分 (严格但不死板, 营利为第一目标)。
 
     硬门槛 (全过才买, 防止乱买):
@@ -4655,6 +4660,11 @@ def _autotrade_buy_screen(symbol: str, opp: Dict, dq: Dict, regime: Dict,
       - bear 且因子分 ≤ 35 → 否决 (重大利空不碰)
       - bear 35~45 → 综合分 -6
       - neutral / 无新闻 → 不影响
+
+    威科夫量价阶段 (借鉴 Wyckoff, 加分/否决):
+      - spring 弹簧 → 综合分 +8 (洗盘买点)
+      - markup 拉升 → +4 | accumulation 吸筹 → +2
+      - markdown 下跌 → -8 | distribution 派发 → 否决
 
     分层加分 (决定买谁):
       - 强趋势 (+8) / 弱趋势 (+2)
@@ -4754,6 +4764,16 @@ def _autotrade_buy_screen(symbol: str, opp: Dict, dq: Dict, regime: Dict,
         if nf_dir == 'bear' and nf_score <= 35:
             reject.append(f"新闻重大利空 (因子{nf_score:.0f}: {'/'.join(factors['news_events'])})")
 
+    # 8. 威科夫量价阶段 (借鉴 Wyckoff: 派发否决 / 弹簧加分)
+    if wyckoff:
+        w_phase = str(wyckoff.get('phase', 'unknown'))
+        w_conf = float(wyckoff.get('confidence', 0) or 0)
+        factors['wyckoff_phase'] = w_phase
+        factors['wyckoff_confidence'] = round(w_conf, 2)
+        factors['wyckoff_note'] = wyckoff.get('note', '')
+        if w_phase == 'distribution' and w_conf >= 0.5:
+            reject.append(f"威科夫派发阶段 (高位放量滞涨, 置信度{w_conf:.0f})")
+
     # 综合分 (排序用)
     comp = score * conf
     if news_factor:
@@ -4773,6 +4793,11 @@ def _autotrade_buy_screen(symbol: str, opp: Dict, dq: Dict, regime: Dict,
                 comp += 4
         elif nf_dir == 'bear' and nf_score > 35:
             comp -= 6
+    if wyckoff:
+        from src.analysis.wyckoff_phase import PHASE_SCORE
+        w_phase = str(wyckoff.get('phase', 'unknown'))
+        if w_phase in PHASE_SCORE and w_phase != 'distribution':
+            comp += PHASE_SCORE[w_phase]
     if trend_strength == 2:
         comp += 8
     elif trend_strength == 1:
@@ -4847,6 +4872,24 @@ def _autotrade_cycle_impl():
         min_keep = int(config.get('autotrade.min_keep_positions', 2) or 2)
         min_rr = float(config.get('autotrade.min_risk_reward', 1.2) or 1.2)
 
+        # ── 环境自适应参数 (借鉴 AgentQuant: regime-adaptive) ──
+        # 进攻环境: 放宽门槛放大预算; 中性: 默认; 防守: 收紧门槛 (已有 allow_new 门禁叠加)
+        _regime_code = str(regime.get('code', 'neutral')).lower()
+        if _regime_code in ('risk_on', 'bull', 'attack'):
+            buy_score = min(buy_score, 55)
+            min_conf = min(min_conf, 0.50)
+            min_rr = min(min_rr, 1.2)
+            _regime_budget = 0.40
+            _autotrade_log(f"市场进攻环境: 门槛放宽 (评分≥{buy_score:.0f}) 预算上限 {_regime_budget:.0%}", "muted")
+        elif _regime_code in ('risk_off', 'bear', 'defensive'):
+            buy_score = max(buy_score, 70)
+            min_conf = max(min_conf, 0.60)
+            min_rr = max(min_rr, 1.8)
+            _regime_budget = 0.25
+            _autotrade_log(f"市场防守环境: 门槛收紧 (评分≥{buy_score:.0f}) 预算上限 {_regime_budget:.0%}", "warn")
+        else:
+            _regime_budget = 0.35
+
         positions = broker.get_positions()
         held = {getattr(p, 'symbol', '') for p in positions}
         total_asset = float(snap['total_asset'] or 0)
@@ -4856,7 +4899,7 @@ def _autotrade_cycle_impl():
         room = max(cash / max(total_asset, 1), 0.0)
 
         # 单笔预算: 按总资产比例, 现金越充足单笔上限越高 (分散风险, 不做总仓位限制)
-        budget_pct = min(max(0.2, room * 0.45), 0.35)
+        budget_pct = min(max(0.2, room * 0.45), _regime_budget)
         if room < 0.02:
             _autotrade_log(f"可用现金仅 {money_cn(cash)}，暂缓买入，仅做持仓管理", "muted")
 
@@ -4942,6 +4985,21 @@ def _autotrade_cycle_impl():
                     news_map[nf["symbol"]] = nf
             except Exception:
                 news_map = {}
+            # 威科夫量价阶段 (对候选池预计算, 供所有候选使用)
+            wyckoff_map = {}
+            try:
+                from src.analysis.wyckoff_phase import detect_phase
+                for s in buy_pool:
+                    try:
+                        h = _load_daily_frame(s, 120)
+                        if h is not None and not h.empty:
+                            wp = detect_phase(h, float(quotes.get(s, {}).get('price', 0) or 0))
+                            if wp.get('phase') != 'unknown':
+                                wyckoff_map[s] = wp
+                    except Exception:
+                        continue
+            except Exception:
+                wyckoff_map = {}
             for symbol in buy_pool:
                 try:
                     history = _load_daily_frame(symbol, 240)
@@ -4967,6 +5025,7 @@ def _autotrade_cycle_impl():
                         symbol, opp, dq, regime, quotes.get(symbol, {}),
                         history, validation, capital, screen_cfg,
                         news_factor=news_map.get(symbol),
+                        wyckoff=wyckoff_map.get(symbol),
                     )
                     if screen["pass"]:
                         candidates.append((symbol, opp, screen))
@@ -4979,6 +5038,38 @@ def _autotrade_cycle_impl():
                 except Exception:
                     continue
             # 按综合分排序, 优先买分析最强的
+            candidates.sort(key=lambda x: x[2]["score"], reverse=True)
+            # 多空辩论 (借鉴 TradingAgents): 对通过初筛的前 3 只候选做三方 LLM 对抗
+            try:
+                from src.ai.debate import run_debate
+                for di, (symbol, opp, screen) in enumerate(candidates[:3]):
+                    f = screen.get("factors", {})
+                    ctx = {
+                        "price": float(opp.get('price', 0) or 0),
+                        "change_pct": float(quotes.get(symbol, {}).get('change_pct', 0) or 0),
+                        "score": f.get('score'), "confidence": f.get('confidence'),
+                        "risk_reward": f.get('risk_reward'),
+                        "trend": f"MA5 {f.get('ma5')} vs MA20 {f.get('ma20')}",
+                        "capital": f"净流入{int(f.get('main_net', 0))}" if f.get('main_net') else "未知",
+                        "news": f"{f.get('news_factor')}({f.get('news_direction')})" if f.get('news_direction') else "",
+                        "wyckoff": f.get('wyckoff_note', ''), "win_rate": f.get('win_rate'),
+                        "samples": f.get('samples'),
+                    }
+                    db = run_debate(symbol, quotes.get(symbol, {}).get('name', symbol), ctx)
+                    if db:
+                        screen["debate"] = db
+                        if db.get("verdict") == "block":
+                            screen["score"] -= 999
+                            _autotrade_log(
+                                f"辩论否决 {symbol}: 风控 {db.get('risk', {}).get('note', '')[:50]}", "warn")
+                        else:
+                            screen["score"] += db.get("adj", 0)
+                            _autotrade_log(
+                                f"辩论 {symbol}: 多{db['bull']['score']:.0f} 空{db['bear']['score']:.0f} "
+                                f"调整{db['adj']:+.1f} 风控{db.get('verdict')}", "muted")
+            except Exception:
+                pass
+            # 重新排序 (辩论调整后)
             candidates.sort(key=lambda x: x[2]["score"], reverse=True)
             # 剩余可加仓金额: 每笔买入后实时扣减, 累计不超过目标仓位
             room_amount = room * total_asset
@@ -5382,6 +5473,35 @@ def _build_daily_review(target_date: Optional[str] = None):
             "content": "当日信号与盈亏未显示明显偏差, 建议维持当前买入标准与仓位纪律。",
         })
 
+    # 6.7 信号反馈闭环 (借鉴 Wyckoff): 每笔成交打结果标签 + 按信号类型统计胜率
+    signal_stats = {"buy": {"对": 0, "错": 0}, "sell": {"对": 0, "错": 0},
+                    "by_signal": {}}
+    last_prices = {}
+    for p in positions:
+        last_prices[getattr(p, 'symbol', '')] = float(getattr(p, 'last_price', 0) or 0)
+    for t in trades:
+        sym = t.get('symbol', '')
+        px = float(t.get('filled_price', 0) or t.get('price', 0) or 0)
+        side = t.get('side', '')
+        ref = last_prices.get(sym, px) or px  # 用当前价判断结果 (收盘复盘近似)
+        if side == 'buy' and px > 0:
+            label = "买对" if ref >= px else "买错"
+        elif side == 'sell' and px > 0:
+            label = "卖对" if ref <= px else "卖飞"  # 卖出后继续跌=对, 反弹=飞
+        else:
+            label = ""
+        t['result_label'] = label
+        if label:
+            key = "对" if label in ("买对", "卖对") else "错"
+            signal_stats[side][key] = signal_stats[side].get(key, 0) + 1
+        # 按信号类型归类 (从自托管 reason 提取)
+        auto = auto_by_symbol.get(sym, [])
+        reason = (auto[0].get('reason', '') if auto else '') or ''
+        sig_key = "新闻驱动" if '新闻' in reason else ("高评分" if '评分6' in reason or '评分7' in reason or '评分8' in reason or '评分9' in reason else "普通信号")
+        bucket = signal_stats["by_signal"].setdefault(sig_key, {"对": 0, "错": 0})
+        if label:
+            bucket[key] = bucket.get(key, 0) + 1
+
     report = {
         "date": today,
         "generated_at": datetime.now().isoformat(),
@@ -5396,6 +5516,7 @@ def _build_daily_review(target_date: Optional[str] = None):
             "sell_count": sell_count,
             "position_count": len(positions),
             "target_position_pct": target_pct,
+            "signal_stats": signal_stats,
         },
         "trades": trades,
         "by_symbol": list(by_symbol.values()),
@@ -5411,6 +5532,28 @@ def _build_daily_review(target_date: Optional[str] = None):
                 _autotrade_state['last_review'] = today
         else:
             _autotrade_log(f"复盘: 保存失败 (文件被占用), 报告仍在内存中可查询", "warn")
+        # 策略记忆库 (借鉴 AgentQuant): 写入信号证据供跨日检索
+        try:
+            from src.analysis.strategy_memory import record_evidence
+            evidence = []
+            auto_map = {}
+            for t in trades:
+                sym = t.get('symbol', '')
+                if sym not in auto_map:
+                    auto = auto_by_symbol.get(sym, [])
+                    auto_map[sym] = (auto[0].get('reason', '') if auto else '') or ''
+                reason = auto_map[sym]
+                sig_type = "新闻驱动" if '新闻' in reason else (
+                    "高评分" if any(k in reason for k in ('评分6', '评分7', '评分8', '评分9')) else "普通信号")
+                evidence.append({
+                    "date": today, "symbol": sym, "name": names.get(sym, sym),
+                    "side": t.get('side', ''), "signal_type": sig_type,
+                    "result_label": t.get('result_label', ''), "pnl": 0.0,
+                    "reason": reason,
+                })
+            record_evidence(evidence)
+        except Exception:
+            pass
     except Exception as e:
         _autotrade_log(f"复盘: 保存失败 {e}", "warn")
     _autotrade_log(f"收盘复盘已生成: {today} 当日盈亏 {money_cn(day_result)}", "ok")
@@ -5425,6 +5568,74 @@ def money_cn(v: float) -> str:
     if abs(v) >= 1e4:
         return f"{v/1e4:.1f}万"
     return f"{v:.0f}元"
+
+
+@app.get("/api/metrics")
+def metrics():
+    """可观测性指标 (Prometheus 文本格式兼容, 借鉴 QuantDinger)。"""
+    try:
+        from src.news.news_factor import get_daily_factors, _cache as _nf_cache
+        from src.analysis.strategy_memory import query_stats
+        snap = _portfolio_snapshot()
+        account = broker.get_account_info()
+        total = float(account.get('total_asset', 0) or 0)
+        mv = float(account.get('market_value', 0) or 0)
+        with _autotrade_lock:
+            cycles = _autotrade_state.get('cycles', 0)
+            autotrade_on = bool(_autotrade_state.get('enabled', False))
+        nf = get_daily_factors()
+        mem = query_stats()
+        lines = [
+            "# HELP aiq_account_total_asset 总资产",
+            "# TYPE aiq_account_total_asset gauge",
+            f"aiq_account_total_asset {total:.2f}",
+            "# HELP aiq_account_position_ratio 仓位占比",
+            "# TYPE aiq_account_position_ratio gauge",
+            f"aiq_account_position_ratio {mv / max(total, 1):.4f}",
+            "# HELP aiq_autotrade_cycles 自托管运行轮次",
+            "# TYPE aiq_autotrade_cycles counter",
+            f"aiq_autotrade_cycles {cycles}",
+            "# HELP aiq_autotrade_enabled 自托管开关",
+            "# TYPE aiq_autotrade_enabled gauge",
+            f"aiq_autotrade_enabled {1 if autotrade_on else 0}",
+            "# HELP aiq_news_factors 今日新闻因子覆盖股票数",
+            "# TYPE aiq_news_factors gauge",
+            f"aiq_news_factors {len(nf.get('factors', []))}",
+            "# HELP aiq_news_count 今日抓取新闻条数",
+            "# TYPE aiq_news_count gauge",
+            f"aiq_news_count {nf.get('news_count', 0)}",
+            "# HELP aiq_memory_evidence 策略记忆库累计样本",
+            "# TYPE aiq_memory_evidence gauge",
+            f"aiq_memory_evidence {mem.get('total', 0)}",
+            "# HELP aiq_trades_buy 模拟盘累计买入笔数",
+            "# TYPE aiq_trades_buy counter",
+            f"aiq_trades_buy {_trading_counters.get('buy', 0)}",
+            "# HELP aiq_trades_sell 模拟盘累计卖出笔数",
+            "# TYPE aiq_trades_sell counter",
+            f"aiq_trades_sell {_trading_counters.get('sell', 0)}",
+        ]
+        return JSONResponse({"success": True, "prometheus": "\n".join(lines),
+                             "json": {"total_asset": round(total, 2),
+                                      "position_ratio": round(mv / max(total, 1), 4),
+                                      "autotrade_cycles": cycles,
+                                      "autotrade_enabled": autotrade_on,
+                                      "news_factors": len(nf.get('factors', [])),
+                                      "news_count": nf.get('news_count', 0),
+                                      "memory_evidence": mem.get('total', 0),
+                                      "trades": dict(_trading_counters)}})
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)})
+
+
+@app.get("/api/memory/signals")
+def memory_signals(signal_type: str = Query(""), days: int = Query(0)):
+    """策略记忆库: 按信号类型统计历史胜率 (借鉴 AgentQuant)。"""
+    try:
+        from src.analysis.strategy_memory import query_stats
+        return JSONResponse({"success": True,
+                             **query_stats(signal_type or None, days or None)})
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)})
 
 
 @app.get("/api/news/factors")

@@ -59,6 +59,15 @@ def _load_index(symbol: str) -> pd.DataFrame:
     return out
 
 
+def bootstrap_ci(vals, n=1000, seed=42):
+    """重采样求均值 95% 置信区间 (借鉴 AgentQuant)."""
+    import numpy as _np
+    rng = _np.random.default_rng(seed)
+    arr = _np.asarray(vals, dtype=float)
+    means = _np.array([rng.choice(arr, size=len(arr), replace=True).mean() for _ in range(n)])
+    return float(_np.percentile(means, 5)), float(_np.percentile(means, 95))
+
+
 def _ret_on(df: pd.DataFrame, d: str) -> float | None:
     """T 日涨跌幅 (%)."""
     import numpy as np
@@ -163,6 +172,7 @@ def main():
             "best_event": round(best, 2),
             "worst_event": round(worst, 2),
             "avg_baseline": None,
+            "ci95_ret_T": [round(bootstrap_ci(rets)[0], 2), round(bootstrap_ci(rets)[1], 2)] if rets else None,
         },
     }
 

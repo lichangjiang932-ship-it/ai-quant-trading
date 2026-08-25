@@ -718,7 +718,9 @@ function renderReview(r){
     return `<div class="rs-reason">【${esc(st.priority)}优先级】<b style="color:${pc}">${esc(st.title)}</b> — ${esc(st.content)}</div>`;
   }).join('');
   const lessons=(r.lessons||[]).map(l=>`<div class="rs-reason">• ${esc(l)}</div>`).join('');
-  const trades=(r.trades||[]).slice(0,12).map(t=>`<tr><td>${esc(t.time||'')}</td><td>${esc(t.symbol)}</td><td class="${t.side==='sell'?'down':'up'}">${t.side==='buy'?'买入':'卖出'}</td><td>${t.quantity||0}</td><td>${Number(t.filled_price||0).toFixed(2)}</td></tr>`).join('');
+  const trades=(r.trades||[]).slice(0,12).map(t=>`<tr><td>${esc(t.time||'')}</td><td>${esc(t.symbol)}</td><td class="${t.side==='sell'?'down':'up'}">${t.side==='buy'?'买入':'卖出'}</td><td>${t.quantity||0}</td><td>${Number(t.filled_price||0).toFixed(2)}</td><td>${esc(t.result_label||'-')}</td></tr>`).join('');
+  const ss=s.signal_stats||{};
+  const signalHtml=(ss.buy&&ss.sell)?`<div class="rs-reason" style="margin-top:8px">信号质量: 买入 ${ss.buy.对||0}对/${ss.buy.错||0}错 · 卖出 ${ss.sell.对||0}对/${ss.sell.错||0}错${(ss.by_signal&&Object.keys(ss.by_signal).length)?' · '+'<span style="font-size:11px">'+Object.entries(ss.by_signal).map(([k,v])=>`${esc(k)} ${v.对||0}对/${v.错||0}错`).join(' | ')+'</span>':''}</div>`:'';
   setHTML(box,`
     <div class="grid kpis" style="grid-template-columns:repeat(4,minmax(0,1fr));margin-top:12px">
       <div class="card"><label>当日盈亏</label><div class="metric ${pnlCls}">${money(s.day_pnl)}</div></div>
@@ -727,12 +729,13 @@ function renderReview(r){
       <div class="card"><label>成交</label><div class="metric">${s.buy_count}买/${s.sell_count}卖</div></div>
     </div>
     <div class="muted" style="margin:10px 0;font-size:11px">总资产 ${money(s.total_asset)} · 仓位 ${(s.position_ratio*100).toFixed(0)}% · 持仓 ${s.position_count} 只 · 目标仓位 ${(s.target_position_pct*100).toFixed(0)}%</div>
+    ${signalHtml}
     <div class="between" style="margin:12px 0 6px"><h3 class="section-title" style="margin:0;font-size:13px">策略建议 <span class="chip buy">供实盘参考</span></h3></div>
     <div class="rs-reasons">${strats||'<div class="muted">暂无策略建议</div>'}</div>
     <div class="between" style="margin:12px 0 6px"><h3 class="section-title" style="margin:0;font-size:13px">当日复盘</h3></div>
     <div class="rs-reasons">${lessons||'<div class="muted">暂无记录</div>'}</div>
-    <div class="between" style="margin:12px 0 6px"><h3 class="section-title" style="margin:0;font-size:13px">当日成交 <span class="muted" style="font-size:10px">近12笔</span></h3></div>
-    ${trades?`<table><thead><tr><th>时间</th><th>代码</th><th>方向</th><th>数量</th><th>价格</th></tr></thead><tbody>${trades}</tbody></table>`:'<div class="muted">今日暂无成交</div>'}
+    <div class="between" style="margin:12px 0 6px"><h3 class="section-title" style="margin:0;font-size:13px">当日成交 <span class="muted" style="font-size:10px">近12笔 · 结果标签</span></h3></div>
+    ${trades?`<table><thead><tr><th>时间</th><th>代码</th><th>方向</th><th>数量</th><th>价格</th><th>结果</th></tr></thead><tbody>${trades}</tbody></table>`:'<div class="muted">今日暂无成交</div>'}
   `);
 }
 function renderRisk(){const r=state.risk,a=state.account;const isLive=state.acctMode==='live';const exposure=Number(r.total_position_pct??((a.market_value||0)/Math.max(a.total_asset||1,1))),dd=Number(r.drawdown||0),orders=Number(r.daily_order_count||0),maxOrders=Number(r.limits?.max_orders_per_day||100);const items=isLive?[['总仓位',exposure,1.0]]:[['总仓位',exposure,Number(r.limits?.max_total_position||.95)],['回撤',dd,Number(r.limits?.max_drawdown||.2)],['今日下单',orders,maxOrders]];setHTML($('riskBars'),items.map(([n,v,m])=>{let ratio=m?Math.min(v/m,1):0,label=n==='今日下单'?`${v}/${m}`:`${(v*100).toFixed(1)}% / ${(m*100).toFixed(0)}%`;return `<div class="limit-row"><div class="between"><span>${n}</span><span class="muted">${label}</span></div><div class="bar"><span style="width:${ratio*100}%;background:${ratio>.85?'#f6465d':ratio>.65?'#d4a24e':'#2bbb7d'}"></span></div></div>`}).join(''))}
