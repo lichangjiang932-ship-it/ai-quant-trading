@@ -351,6 +351,19 @@ events = tpsl.on_quote("sh600000", 11.0)   # 触发止盈
 - 每次买入前 → 调用 `RiskManager.check_order`
 - 任何拦截 / 触发 → 推送通知 + 记录日志
 
+### 交易保护机制 (借鉴 Freqtrade Protections)
+
+自托管自动交易内置四道防线（`src/risk/protections.py`，参数见 `config.yaml autotrade.protections`）：
+
+| 机制 | 规则 | 默认值 |
+|------|------|--------|
+| CooldownPeriod 冷却期 | 卖出后同股禁止买回 | 3 天 |
+| StoplossGuard 连亏熔断 | 近5天止损≥2次 → 全局暂停开仓 | 暂停2天 |
+| MaxDrawdownGuard 回撤熔断 | 组合自峰值回撤≥8% → 暂停新开仓 | 8% |
+| TrailingStop 追踪止盈 | 浮盈≥4%激活，自持仓最高点回落3%离场 | 4%/3% |
+
+另有 **ATR 波动率仓位**：单笔风险 = 组合×1%，股数 = 风险额/(ATR×2)，波动大的股票自动降低手数。
+
 ## 投资组合分析
 
 ```python

@@ -50,6 +50,17 @@ autotrade:
   target_position_pct: 1.0
   temperature: 0.3
   use_memory: true
+  # 保护机制 (借鉴 Freqtrade Protections)
+  protections:
+    cooldown_days: 3            # 卖出后同股冷却天数 (防反复接刀)
+    stoploss_lookback_days: 5   # 连亏熔断滚动窗口
+    stoploss_max_count: 2       # 窗口内止损≥此次数触发熔断
+    stoploss_pause_days: 2      # 熔断暂停开仓天数
+    max_drawdown_pct: 0.08      # 组合自峰值回撤超此比例暂停新开仓
+    trail_activate_pct: 0.04    # 浮盈达4%后启用追踪止盈
+    trail_drawdown_pct: 0.03    # 自持仓最高点回撤3%离场
+    atr_risk_pct: 0.01          # ATR仓位: 单笔风险占组合1%
+    atr_stop_mult: 2.0          # 止损距离 = ATR×2
 broker:
   account_id: ''
   guling_agent_token: ''

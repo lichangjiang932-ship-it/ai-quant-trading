@@ -202,6 +202,60 @@ if risk_runtime.get('date') == datetime.now().date().isoformat():
 risk_mgr.peak_equity = float(
     risk_runtime.get('peak_equity', broker.get_account_info().get('total_asset', 0)) or 0
 )
+
+# ── 交易保护机制 (借鉴 Freqtrade Protections) + 净值记录 ──
+from src.risk.protections import (
+    ProtectionConfig,
+    TrailingState,
+    atr_position_qty,
+    cooldown_block_reason,
+    drawdown_guard_pause,
+    load_protection_config,
+    stoploss_guard_pause,
+    trailing_stop_hit,
+    update_trailing_high,
+    compute_atr,
+)
+
+
+def _load_protection_cfg() -> ProtectionConfig:
+    """从 config.yaml autotrade.protections 读取保护参数, 缺省用内置默认值。"""
+    try:
+        raw = config.get('autotrade', {}) or {}
+    except Exception:
+        raw = {}
+    return load_protection_config(raw if isinstance(raw, dict) else {})
+
+
+_trailing_highs: Dict[str, float] = dict(
+    state_manager.load_account_state('autotrade_trailing_highs', {}) or {}
+)
+_equity_history: List[dict] = list(state_manager.load_account_state('equity_history', []) or [])
+
+
+def _persist_trailing_highs():
+    try:
+        state_manager.save_account_state('autotrade_trailing_highs', _trailing_highs)
+    except Exception:
+        pass
+
+
+def _record_equity_point(value: float, now=None):
+    """每个交易日收盘记录一条净值点 (当日重复调用只更新数值)。"""
+    now = now or datetime.now()
+    d = now.date().isoformat()
+    v = round(float(value or 0), 2)
+    for p in _equity_history:
+        if p.get('date') == d:
+            p['value'] = v
+            break
+    else:
+        _equity_history.append({"date": d, "value": v})
+        del _equity_history[:-750]  # 最多保留约3年
+    try:
+        state_manager.save_account_state('equity_history', _equity_history)
+    except Exception:
+        pass
 opportunity_scorer = OpportunityScorer(OpportunityConfig(
     risk_per_trade=config.get('risk.max_risk_per_trade', 0.0075),
     max_position_pct=config.get('risk.max_position_size', 0.12),
@@ -4895,6 +4949,8 @@ def _autotrade_cycle_impl():
         total_asset = float(snap['total_asset'] or 0)
         cash = float(snap['cash'] or 0)
         current_pos_pct = float(snap['market_value']) / max(total_asset, 1)
+        # 每日净值点 (供 /api/performance/report 绩效分析)
+        _record_equity_point(total_asset, now)
         # 剩余可用空间 = 现金比例 (仓位不设上限)
         room = max(cash / max(total_asset, 1), 0.0)
 
@@ -4904,6 +4960,47 @@ def _autotrade_cycle_impl():
             _autotrade_log(f"可用现金仅 {money_cn(cash)}，暂缓买入，仅做持仓管理", "muted")
 
         bought, sold = [], []
+        prot_cfg = _load_protection_cfg()
+
+        # === ①⁺ 追踪止损 (借鉴 Freqtrade): 浮盈达激活线后, 自持仓最高点回撤超阈值即离场 ===
+        for p in list(positions):
+            sym_t = getattr(p, 'symbol', '')
+            price_t = float((quotes.get(sym_t, {}) or {}).get('price', 0) or 0)
+            if price_t <= 0:
+                continue
+            high_t = max(float(_trailing_highs.get(sym_t, 0.0) or 0), price_t)
+            _trailing_highs[sym_t] = high_t
+            hit_t = trailing_stop_hit(float(getattr(p, 'avg_cost', 0) or 0), high_t, price_t, prot_cfg)
+            if not hit_t:
+                continue
+            pos_obj = snap['pos_map'].get(sym_t) or p
+            avail_t = int(getattr(pos_obj, 'available_quantity', 0) or 0)
+            if avail_t <= 0:
+                continue
+            name_t = (quotes.get(sym_t, {}) or {}).get('name') or COMMON_SYMBOL_NAMES.get(sym_t, sym_t)
+            try:
+                resp = place_order({
+                    "symbol": sym_t, "side": "sell", "quantity": avail_t, "price": price_t,
+                    "reason": "autotrade_trail_stop",
+                    "client_order_id": f"auto-{now.strftime('%Y%m%d%H%M%S')}-{sym_t}-trail",
+                })
+                payload = json.loads(resp.body.decode('utf-8'))
+                if payload.get('success'):
+                    _autotrade_record_trade({
+                        "symbol": sym_t, "name": name_t, "side": "sell",
+                        "quantity": avail_t, "price": price_t,
+                        "reason": hit_t,
+                        "order_id": payload.get('order_id', ''),
+                    })
+                    _trailing_highs.pop(sym_t, None)
+                    _persist_trailing_highs()
+                    sold.append(sym_t)
+                    _autotrade_log(f"追踪止盈 {name_t}({sym_t}) {avail_t}股 @{price_t:.2f} — {hit_t}", "sell")
+                else:
+                    _autotrade_log(f"追踪止盈 {sym_t} 被拒: {payload.get('error', '')[:60]}", "warn")
+            except Exception as e:
+                _autotrade_log(f"追踪止盈 {sym_t} 异常: {e}", "err")
+
 
         # === ① 卖出处理 (持仓): 复用确定性信号 (止损/止盈/退出计划) ===
         held_syms = [s for s in symbols if s in held]
@@ -4969,8 +5066,27 @@ def _autotrade_cycle_impl():
                 f"({ipo_guard_hit.get('date')}, {ipo_guard_hit.get('note','')})",
                 "warn",
             )
-        if room > 0.05 and len(positions) < max_positions and ipo_guard_hit is None:
-            buy_pool = [s for s in symbols if s not in held]
+        # ── 保护机制全局检查 (借鉴 Freqtrade Protections) ──
+        protection_pause: List[str] = []
+        _sg = stoploss_guard_pause(_autotrade_state.get('trades', []), now.date(), prot_cfg)
+        if _sg:
+            protection_pause.append(_sg)
+        _dg = drawdown_guard_pause(total_asset, float(risk_mgr.peak_equity or 0), prot_cfg)
+        if _dg:
+            protection_pause.append(_dg)
+        for _pz in protection_pause:
+            _autotrade_log(_pz, "warn")
+
+        buy_pool = []
+        for s in symbols:
+            if s in held:
+                continue
+            cd = cooldown_block_reason(s, _autotrade_state.get('trades', []), now.date(), prot_cfg)
+            if cd:
+                _autotrade_log(f"冷却跳过 {s} — {cd}", "muted")
+                continue
+            buy_pool.append(s)
+        if room > 0.05 and len(positions) < max_positions and ipo_guard_hit is None and not protection_pause:
             candidates = []
             target_date = target_trading_date(now, _premarket_holidays())
             screen_cfg = {
@@ -5027,6 +5143,11 @@ def _autotrade_cycle_impl():
                         news_factor=news_map.get(symbol),
                         wyckoff=wyckoff_map.get(symbol),
                     )
+                    # ATR 波动率 (供风险预算仓位 sizing, 借鉴 Freqtrade custom_stake_amount)
+                    try:
+                        screen['atr'] = round(compute_atr(history), 3)
+                    except Exception:
+                        screen['atr'] = 0.0
                     if screen["pass"]:
                         candidates.append((symbol, opp, screen))
                     else:
@@ -5084,6 +5205,16 @@ def _autotrade_cycle_impl():
                 suggested = int(opp.get('suggested_qty', 0) or 0)
                 budget = min(budget_pct * total_asset, room_amount)
                 max_by_budget = int(budget / price / 100) * 100 if price > 0 else 0
+                # ATR 风险预算: 单笔亏损上限 = 总资产×atr_risk_pct, 波动大→股数少 (借鉴 Freqtrade/vnpy)
+                risk_qty = atr_position_qty(
+                    price, float(screen.get('atr', 0) or 0), total_asset, prot_cfg
+                )
+                if risk_qty > 0:
+                    if risk_qty < max_by_budget:
+                        _autotrade_log(
+                            f"{symbol} ATR仓位: {risk_qty}股 (预算上限 {max_by_budget}股, "
+                            f"单笔风险 {prot_cfg.atr_risk_pct:.1%})", "muted")
+                    max_by_budget = min(max_by_budget, risk_qty)
                 qty = min(suggested, max_by_budget) if suggested > 0 else max_by_budget
                 qty = max(qty // 100 * 100, 0)
                 if qty <= 0:
@@ -5112,6 +5243,8 @@ def _autotrade_cycle_impl():
                         })
                         bought.append(symbol)
                         room_amount -= qty * price
+                        _trailing_highs[symbol] = price  # 追踪止损从买价起算
+                        _persist_trailing_highs()
                         _autotrade_log(
                             f"AI买入 {name}({symbol}) {qty}股 @{price:.2f} | "
                             f"评分{f.get('score')} 置信度{f.get('confidence')} 胜率{f.get('win_rate')}%{news_part}",
@@ -5568,6 +5701,39 @@ def money_cn(v: float) -> str:
     if abs(v) >= 1e4:
         return f"{v/1e4:.1f}万"
     return f"{v:.0f}元"
+
+
+@app.get("/api/performance/report")
+def performance_report_api():
+    """组合绩效报告 (借鉴 QuantStats/Qlib risk_analysis)。
+
+    基于每日净值点 (自托管循环自动记录) 计算 年化收益/Sharpe/Sortino/
+    Calmar/最大回撤/月度收益表, 并对比基准 (沪深300) 区间收益。
+    """
+    try:
+        from src.research.performance import performance_report, _series
+        points = list(_equity_history or [])
+        trades = _autotrade_state.get('trades', [])
+        # 基准: 沪深300 与净值区间对齐的收盘序列
+        bench_points = []
+        try:
+            bmk = _load_daily_frame('sh000300', 500)
+            if bmk is not None and not bmk.empty:
+                for d, row in bmk.iterrows():
+                    try:
+                        bench_points.append({
+                            "date": str(d)[:10],
+                            "value": round(float(row['Close']), 2),
+                        })
+                    except (KeyError, TypeError, ValueError):
+                        continue
+        except Exception:
+            pass
+        report = performance_report(points, trades=trades, benchmark_points=bench_points)
+        report["equity_curve"] = points[-120:]  # 最近120个点供前端画图
+        return JSONResponse(content={"success": True, "data": report})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
 
 
 @app.get("/api/metrics")
