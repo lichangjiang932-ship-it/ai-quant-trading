@@ -175,8 +175,11 @@ def fetch_hot_news(max_per_source: int = 12) -> List[Dict]:
             "symbols": getattr(item, "symbols", []) or [],
         })
 
+    # 多源并行抓取: 5 个常规快讯源 + 同花顺/一财 + 热议股/研报 信号源
     for fn_name in ("fetch_sina_live_news", "fetch_wallstreetcn_news",
-                    "fetch_eastmoney_news", "fetch_sina_finance_news"):
+                    "fetch_eastmoney_news", "fetch_sina_finance_news",
+                    "fetch_yicai_news", "fetch_ths_news",
+                    "fetch_hot_stocks_by_media", "fetch_research_reports"):
         try:
             items = _get(nf, fn_name, max_per_source)
             for it in items:

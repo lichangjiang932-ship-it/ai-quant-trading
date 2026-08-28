@@ -4611,10 +4611,34 @@ AUTOTRADE_CANDIDATES: List[str] = [
 ]
 
 
-def _autotrade_candidate_pool() -> List[str]:
-    """候选池 = 当前持仓 + 内置活跃池 + 自选股 + AI选股结果, 去重取前 16。
+def _autotrade_held_days(symbol: str) -> int:
+    """该持仓已持有多少自然日 (按最近一次买入日期计算)。
 
-    关键修复: 必须包含未持仓的新股票, 否则买入分支永远没有标的。
+    返回 -1 表示在近期记录里找不到该股的买入记录 (如持仓来自更早的会话),
+    此时调用方应放行卖出, 避免误锁仓。
+    """
+    trades = _autotrade_state.get("trades", []) or []
+    for t in trades:  # trades 按时间倒序插入(最新在前)
+        if t.get("symbol") == symbol and t.get("side") == "buy":
+            try:
+                buy_date = datetime.strptime(t.get("date", ""), "%Y-%m-%d").date()
+            except (ValueError, TypeError):
+                return -1
+            return (datetime.now().date() - buy_date).days
+    return -1
+
+
+def _autotrade_candidate_pool() -> List[str]:
+    """候选池 = 当前持仓 + 全市场粗筛漏斗 + 内置活跃池 + 自选 + AI选股。
+
+    关键改造 (原实现硬截断 16 只, 是选股路径的最大瓶颈):
+    原候选只来自"内置活跃池(约16~30只) + 自选 + AI选股", 在 5000+ 只 A 股里
+    只看十几只 —— 导致反复在同一批票里进出(某白酒龙头3次全亏), 以及行情好时
+    "一天选不到股票"。现改为两级漏斗:
+      ① 全市场粗筛 (纯 HTTP 快照, 便宜): 5000+ → 按流动性/市值/换手/涨幅
+         硬过滤 → 约 60 只, 涨跌都覆盖(按成交额排序, 保留回调中的买点)
+      ② 精筛 (现有 _autotrade_buy_screen, 昂贵: 拉K线+多因子+LLM)
+    持仓永远优先保留, 保证卖出逻辑不被漏斗挤掉。
     """
     syms: List[str] = []
     held: set = set()
@@ -4627,8 +4651,22 @@ def _autotrade_candidate_pool() -> List[str]:
                     syms.append(s)
     except Exception:
         pass
-    # 未持仓候选: 内置活跃池 + 自选股 + 最近 AI 选股结果
-    extra = list(AUTOTRADE_CANDIDATES) + list(_get_watchlist() or [])
+
+    extra: List[str] = []
+    # ① 全市场粗筛漏斗 (主要来源)
+    try:
+        from src.analysis.market_scanner import scan_candidates, load_prefilter_config
+        _pf_cfg = load_prefilter_config(config.get('autotrade', {}) or {})
+        for row in scan_candidates(_pf_cfg):
+            s = _normalize_symbol(str(row.get('symbol', '')))
+            if s:
+                extra.append(s)
+        _autotrade_log(f"全市场粗筛: 得到 {len(extra)} 只候选", "muted")
+    except Exception as e:
+        _autotrade_log(f"全市场粗筛不可用({type(e).__name__}), 回退内置池", "warn")
+
+    # ② 内置活跃池 + 自选股 + 最近 AI 选股 (兜底与人工偏好)
+    extra.extend(list(AUTOTRADE_CANDIDATES) + list(_get_watchlist() or []))
     try:
         with _scan_lock:
             for pick in (_scan_job.get("picks") or []):
@@ -4637,11 +4675,13 @@ def _autotrade_candidate_pool() -> List[str]:
                     extra.append(s)
     except Exception:
         pass
+
     for s in extra:
         s = _normalize_symbol(s)
         if s and s not in held and s not in syms:
             syms.append(s)
-    return syms[:16]
+    # 持仓 + 全市场候选 + 兜底池; 上限放宽到 80 (漏斗已按成交额排序, 前列最活跃)
+    return syms[:80]
 
 
 def _autotrade_log(msg: str, kind: str = "info"):
@@ -4828,6 +4868,19 @@ def _autotrade_buy_screen(symbol: str, opp: Dict, dq: Dict, regime: Dict,
         if w_phase == 'distribution' and w_conf >= 0.5:
             reject.append(f"威科夫派发阶段 (高位放量滞涨, 置信度{w_conf:.0f})")
 
+    # 9. 技术因子 (借鉴 Qlib Alpha158: RSI/MACD/BOLL/量价/动量/波动率)
+    try:
+        from src.analysis.alpha_factors import evaluate_alpha
+        _alpha = evaluate_alpha(history, price)
+    except Exception:
+        _alpha = {}
+    if _alpha:
+        for k, v in (_alpha.get("detail") or {}).items():
+            factors[f"alpha_{k}"] = v
+        if _alpha.get("veto"):
+            reject.append(_alpha["veto"])
+        factors["alpha_notes"] = "、".join(_alpha.get("notes", [])[:3])
+
     # 综合分 (排序用)
     comp = score * conf
     if news_factor:
@@ -4856,6 +4909,9 @@ def _autotrade_buy_screen(symbol: str, opp: Dict, dq: Dict, regime: Dict,
         comp += 8
     elif trend_strength == 1:
         comp += 2
+    # 技术因子综合调整 (Qlib Alpha158 精简版)
+    if _alpha:
+        comp += float(_alpha.get("adjust", 0) or 0)
     if capital and float(capital.get('main_net', 0) or 0) > 0:
         comp += 6
     elif capital and float(capital.get('main_net', 0) or 0) < 0:
@@ -5021,6 +5077,19 @@ def _autotrade_cycle_impl():
                 if len(positions) <= min_keep and not any(k in reason for k in ('止损', '回撤', '破位')):
                     _autotrade_log(f"持仓仅 {len(positions)} 只(保护线 {min_keep})，暂缓止盈 {name}({symbol})", "muted")
                     continue
+
+                # 最小持有期 (借鉴 Freqtrade minimum_roi 的时间维度):
+                # 亏损归因显示多笔"买入次日即卖"全部亏损, 手续费+噪音吃掉收益。
+                # 硬风险理由(止损/回撤/破位)可穿越, 其余信号须持满 min_hold_days。
+                is_hard_risk = any(k in reason for k in ('止损', '回撤', '破位'))
+                if not is_hard_risk and prot_cfg.min_hold_days > 0:
+                    held_days = _autotrade_held_days(symbol)
+                    if 0 <= held_days < prot_cfg.min_hold_days:
+                        _autotrade_log(
+                            f"最短持有期未满足 {name}({symbol}) 仅持有{held_days}天 "
+                            f"(要求{prot_cfg.min_hold_days}天), 暂缓卖出", "muted")
+                        continue
+
                 avail = int(getattr(pos, 'available_quantity', 0) or 0)
                 suggested = int(sig.get('suggested_qty', 0) or 0) or avail
                 suggested = min(suggested, avail)
@@ -5238,7 +5307,9 @@ def _autotrade_cycle_impl():
                             "symbol": symbol, "name": name, "side": "buy",
                             "quantity": qty, "price": price,
                             "reason": (f"评分{f.get('score')} 置信度{f.get('confidence')} "
-                                       f"胜率{f.get('win_rate')}% 资金{'净流入' if f.get('flow_direction')=='inflow' else f.get('flow_direction','')}{news_part} | {reason[:35]}"),
+                                       f"胜率{f.get('win_rate')}% 资金{'净流入' if f.get('flow_direction')=='inflow' else f.get('flow_direction','')}"
+                                       + (f" 技术[{f.get('alpha_notes','')[:30]}]" if f.get('alpha_notes') else '')
+                                       + news_part + f" | {reason[:35]}"),
                             "order_id": payload.get('order_id', ''),
                         })
                         bought.append(symbol)
@@ -5701,6 +5772,44 @@ def money_cn(v: float) -> str:
     if abs(v) >= 1e4:
         return f"{v/1e4:.1f}万"
     return f"{v:.0f}元"
+
+
+@app.get("/api/market/candidates")
+def market_candidates_api():
+    """全市场选股漏斗结果 (第一级粗筛), 供前端观察选股路径覆盖面。
+
+    返回全市场快照经流动性/市值/换手/涨幅/价格硬过滤后的候选,
+    并给出"扫描了多少只 → 剩多少只"的漏斗统计。
+    """
+    try:
+        from src.analysis.market_scanner import (
+            fetch_market_snapshot, load_prefilter_config, prefilter_market,
+        )
+        cfg = load_prefilter_config(config.get('autotrade', {}) or {})
+        rows = fetch_market_snapshot(cfg)
+        cands = prefilter_market(rows, cfg)
+        return JSONResponse({
+            "success": True,
+            "scanned": len(rows),
+            "candidates": len(cands),
+            "config": {
+                "min_amount": cfg.min_amount,
+                "max_change_pct": cfg.max_change_pct,
+                "max_candidates": cfg.max_candidates,
+            },
+            "items": [{
+                "symbol": r.get("symbol", ""),
+                "name": r.get("name", ""),
+                "price": r.get("price"),
+                "change_pct": r.get("change_pct"),
+                "amount": r.get("amount"),
+                "turnover": r.get("turnover"),
+                "float_mktcap_yi": r.get("float_mktcap_yi"),
+            } for r in cands],
+        })
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)[:200],
+                             "scanned": 0, "candidates": 0, "items": []})
 
 
 @app.get("/api/performance/report")

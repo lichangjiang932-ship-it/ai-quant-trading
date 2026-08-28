@@ -61,6 +61,22 @@ autotrade:
     trail_drawdown_pct: 0.03    # 自持仓最高点回撤3%离场
     atr_risk_pct: 0.01          # ATR仓位: 单笔风险占组合1%
     atr_stop_mult: 2.0          # 止损距离 = ATR×2
+    min_hold_days: 2            # 非硬风险信号的最短持有天数 (防买入次日即卖)
+    loss_streak_cooldown_mult: 2.0  # 同股连亏时冷却期倍数 (茅台反复3次全亏的归因)
+  # 全市场选股漏斗 (第一级粗筛, 便宜; 精筛仍走 _autotrade_buy_screen)
+  prefilter:
+    min_amount: 100000000       # 成交额下限 1亿 (流动性门槛)
+    min_turnover: 1.0           # 换手率下限 %
+    max_turnover: 20.0          # 换手率上限 % (过高=情绪过热/出货)
+    min_float_mktcap_yi: 50.0   # 流通市值下限 (亿, 剔微盘)
+    max_float_mktcap_yi: 5000.0 # 流通市值上限 (亿, 剔超大盘)
+    min_change_pct: -5.0        # 当日跌幅下限 (防接飞刀)
+    max_change_pct: 9.0         # 当日涨幅上限 (防追涨停/追高)
+    min_price: 3.0              # 股价下限 (剔仙股)
+    max_price: 300.0            # 股价上限
+    page_size: 100              # 单页条数
+    max_pages: 3                # 翻页数 (3×100=300只快照)
+    max_candidates: 60          # 粗筛后交给精筛的候选数
 broker:
   account_id: ''
   guling_agent_token: ''

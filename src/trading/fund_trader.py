@@ -202,6 +202,8 @@ class FundTrader:
                 h = self.get_holdings(cat)
             except FundNotInitializedError:
                 raise
+            except FundTokenExpiredError:
+                raise  # token 过期必须冒泡, 否则前端误显示"空持仓"
             except FundTraderError:
                 continue
             rows = (
@@ -225,6 +227,8 @@ class FundTrader:
         try:
             merged["wallet"] = self.get_wallet_home()
         except FundNotInitializedError:
+            raise
+        except FundTokenExpiredError:
             raise
         except FundTraderError:
             pass

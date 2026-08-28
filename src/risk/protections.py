@@ -40,6 +40,11 @@ class ProtectionConfig:
     atr_risk_pct: float = 0.01
     atr_stop_mult: float = 2.0
     atr_period: int = 14
+    # 最小持有天数: 非硬风险(止损/回撤/破位)的卖出信号须持满该天数,
+    # 避免"买入次日即卖"被手续费与噪音吃掉收益 (亏损归因得出的关键项)
+    min_hold_days: int = 2
+    # 同股连亏时冷却期放大倍数: 有效冷却 = cooldown_days × (1 + min(连亏,3)×(mult-1))
+    loss_streak_cooldown_mult: float = 2.0
 
 
 DEFAULT_CONFIG = ProtectionConfig()
@@ -82,11 +87,31 @@ def _recent_trades(trades: List[dict], now: date, lookback_days: int) -> List[di
 
 # ─────────────────────── 1+2: 买入前检查 ───────────────────────
 
+def _symbol_loss_streak(symbol: str, trades: List[dict], now: date,
+                        lookback: int = 30) -> int:
+    """该股在 lookback 天内被止损/亏损卖出的次数。
+
+    只认 sell 记录里带风险理由(止损/回撤/破位)的, 这类才是"被打脸"的出场。
+    """
+    n = 0
+    cutoff = now - timedelta(days=max(lookback, 1))
+    for t in trades or []:
+        if t.get('symbol') != symbol or str(t.get('side')) != 'sell':
+            continue
+        d = parse_date(t.get('date'))
+        reason = str(t.get('reason', ''))
+        if d and d >= cutoff and any(k in reason for k in ('止损', '回撤', '破位')):
+            n += 1
+    return n
+
+
 def cooldown_block_reason(symbol: str, trades: List[dict], now: date,
                           cfg: ProtectionConfig = DEFAULT_CONFIG) -> Optional[str]:
     """该股最近卖出过且仍在冷却期内 → 返回原因, 否则 None。
 
-    匹配规则: 最近一条针对该 symbol 的 sell 记录距今 < cooldown_days。
+    匹配规则: 最近一条针对该 symbol 的 sell 记录距今 < 有效冷却天数。
+    有效冷却天数随该股近期连亏次数放大 —— 归因发现同一只股票(如某白酒龙头)
+    反复进出 3 次全部亏损, 固定冷却期挡不住"打完脸又回去买"。
     """
     latest_sell = None
     for t in trades or []:
@@ -96,9 +121,16 @@ def cooldown_block_reason(symbol: str, trades: List[dict], now: date,
                 latest_sell = d
     if latest_sell is None:
         return None
+
+    losses = _symbol_loss_streak(symbol, trades, now)
+    mult = max(float(getattr(cfg, 'loss_streak_cooldown_mult', 1.0) or 1.0), 1.0)
+    effective = int(max(cfg.cooldown_days, 0) * (1 + min(losses, 3) * (mult - 1)))
+
     elapsed = (now - latest_sell).days
-    if elapsed < max(cfg.cooldown_days, 0):
-        return f"冷却期: {latest_sell.isoformat()} 刚卖出, 需等 {cfg.cooldown_days} 天 (已过 {elapsed} 天)"
+    if elapsed < effective:
+        extra = f", 含连亏{losses}次放大" if losses else ""
+        return (f"冷却期: {latest_sell.isoformat()} 刚卖出, 需等 {effective} 天"
+                f"(已过 {elapsed} 天{extra})")
     return None
 
 

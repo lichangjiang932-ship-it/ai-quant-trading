@@ -109,6 +109,16 @@ def _cffi_get(url, params, merged_headers, timeout, **kwargs):
                      timeout=timeout, impersonate=_IMPERSONATE, **kwargs)
 
 
+def _cffi_post(url, body, merged_headers, timeout, **kwargs):
+    """POST 版: 东财少数接口(如热议股排行)只收 JSON body, 需 POST。"""
+    sess = _CFFI_SESSION
+    if sess is not None:
+        return sess.post(url, json=body, headers=merged_headers,
+                         timeout=timeout, **kwargs)
+    return _cffi.post(url, json=body, headers=merged_headers,
+                     timeout=timeout, impersonate=_IMPERSONATE, **kwargs)
+
+
 def em_get(url: str, params: Optional[Dict] = None, headers: Optional[Dict] = None,
            timeout: int = 15, **kwargs):
     """东财统一请求入口: 自动节流 + 复用 session + 默认 UA + 浏览器 TLS 指纹。
@@ -138,6 +148,34 @@ def em_get(url: str, params: Optional[Dict] = None, headers: Optional[Dict] = No
             # 2) 回退: 普通 requests(带限流 + 重试)
             return _EM_SESSION.get(url, params=params, headers=merged_headers,
                                    timeout=timeout, **kwargs)
+        finally:
+            _last_call[0] = time.time()
+
+
+def em_post(url: str, body: Optional[Dict] = None, headers: Optional[Dict] = None,
+           timeout: int = 15, **kwargs):
+    """东财统一 POST 入口: 复用 em_get 的节流 + curl_cffi 指纹 + 回退逻辑。
+
+    用于只接受 JSON body 的东财接口(如 emappdata 热议股排行)。
+    返回 Response 对象(具备 .json()/.text/.status_code)。
+    """
+    with _lock:
+        wait = EM_MIN_INTERVAL - (time.time() - _last_call[0])
+        if wait > 0:
+            time.sleep(wait + random.uniform(0.1, 0.5))
+        try:
+            merged_headers = {"User-Agent": UA,
+                              "Content-Type": "application/json"}
+            if headers:
+                merged_headers.update(headers)
+
+            if _HAS_CFFI:
+                try:
+                    return _cffi_post(url, body, merged_headers, timeout, **kwargs)
+                except Exception:
+                    pass
+            return _EM_SESSION.post(url, json=body, headers=merged_headers,
+                                    timeout=timeout, **kwargs)
         finally:
             _last_call[0] = time.time()
 

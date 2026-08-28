@@ -141,5 +141,62 @@ def test_load_protection_config_from_dict():
     assert cfg.stoploss_max_count == ProtectionConfig().stoploss_max_count
 
 
+# ── 亏损归因新增项: 同股连亏放大冷却期 + 最小持有期 ──
+def _sell(symbol, day, reason="止盈"):
+    return {"symbol": symbol, "side": "sell", "date": day.isoformat(), "reason": reason}
+
+
+def test_cooldown_unchanged_when_no_loss_streak():
+    """无连亏记录的股票, 冷却期保持基础天数。"""
+    today = date(2026, 8, 28)
+    trades = [_sell("sz002594", today, "止盈")]
+    cfg = ProtectionConfig(cooldown_days=3, loss_streak_cooldown_mult=2.0)
+    hit = cooldown_block_reason("sz002594", trades, today, cfg)
+    assert hit is not None and "需等 3 天" in hit
+
+
+def test_cooldown_scales_with_loss_streak():
+    """归因: 某白酒龙头反复进出 3 次全亏, 固定冷却期挡不住, 需按连亏放大。"""
+    today = date(2026, 8, 28)
+    trades = [
+        _sell("sh600519", today, "止损 破位"),
+        _sell("sh600519", date(2026, 8, 21), "止损"),
+        _sell("sh600519", date(2026, 8, 20), "回撤"),
+    ]
+    cfg = ProtectionConfig(cooldown_days=3, loss_streak_cooldown_mult=2.0)
+    hit = cooldown_block_reason("sh600519", trades, today, cfg)
+    assert hit is not None
+    # 连亏 3 次 → 3 × (1 + 3×(2-1)) = 12 天
+    assert "需等 12 天" in hit
+    assert "连亏3次" in hit
+
+
+def test_cooldown_loss_streak_capped_at_three():
+    """连亏次数封顶 3, 避免冷却期无限膨胀。"""
+    today = date(2026, 8, 28)
+    trades = [_sell("sz000001", today, "止损") for _ in range(6)]
+    cfg = ProtectionConfig(cooldown_days=3, loss_streak_cooldown_mult=2.0)
+    hit = cooldown_block_reason("sz000001", trades, today, cfg)
+    assert hit is not None and "需等 12 天" in hit
+
+
+def test_no_cooldown_for_symbol_never_sold():
+    assert cooldown_block_reason("sh600030", [], date(2026, 8, 28)) is None
+
+
+def test_min_hold_days_default_and_config():
+    """最小持有期: 默认 2 天, 且能从 config 段加载。"""
+    assert ProtectionConfig().min_hold_days == 2
+    cfg = load_protection_config({"protections": {"min_hold_days": 5}})
+    assert cfg.min_hold_days == 5
+
+
+def test_load_config_includes_new_keys():
+    cfg = load_protection_config({"protections": {
+        "min_hold_days": 4, "loss_streak_cooldown_mult": 3.0}})
+    assert cfg.min_hold_days == 4
+    assert cfg.loss_streak_cooldown_mult == 3.0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

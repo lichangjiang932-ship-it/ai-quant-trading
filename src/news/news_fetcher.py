@@ -11,7 +11,7 @@ from typing import Dict, List, Optional
 from threading import Thread, Event
 import pandas as pd
 
-from ..data.em_client import em_get  # 东财请求统一走节流器,防封 IP
+from ..data.em_client import em_get, em_post  # 东财请求统一走节流器,防封 IP (em_post 用于 JSON-body 接口)
 
 
 def _clean_stock_code(symbol: str) -> str:
@@ -221,8 +221,11 @@ class NewsFetcher:
         try:
             url = "https://news.10jqka.com.cn/tapp/news/push/stock/"
             params = {'page': 1, 'tag': '', 'track': 'website', 'pagesize': count}
-            
-            response = requests.get(url, headers=self.headers, timeout=10)
+
+            # 同花顺接口需带同花顺 Referer + Chrome 指纹(em_get 已处理), 普通 requests 会被屏蔽
+            response = em_get(url, params=params,
+                              headers={'Referer': 'https://news.10jqka.com.cn/'},
+                              timeout=10)
             data = response.json()
             
             if data.get('data') and data['data'].get('list'):
@@ -390,8 +393,12 @@ class NewsFetcher:
             print(f"获取公告失败: {e}")
         return news_list
     
-    def fetch_research_reports(self, keyword: str = None, count: int = 20) -> List[NewsItem]:
-        """获取研报数据"""
+    def fetch_research_reports(self, count: int = 20, keyword: str = None) -> List[NewsItem]:
+        """获取研报数据。
+
+        count 是第一个位置参数, 与其余 fetch_* 保持一致 —— 日度管线按
+        fn(max_per_source) 位置调用, 若第一个参数是 keyword 会把条数误当个股代码。
+        """
         news_list = []
         try:
             # 东方财富研报
@@ -407,9 +414,11 @@ class NewsFetcher:
                 # report/list 的 code 参数支持按个股定向查询，避免先拉市场研报再错误过滤。
                 params['code'] = _clean_stock_code(keyword)
 
-            response = em_get(url, params=params, headers=self.headers, timeout=10)
+            response = em_get(url, params=params,
+                              headers={'Referer': 'https://data.eastmoney.com/'},
+                              timeout=10)
             data = response.json()
-            
+
             if data.get('data'):
                 for item in data['data']:
                     title = item.get('title', '')
@@ -481,20 +490,22 @@ class NewsFetcher:
         return news_list
     
     def fetch_hot_stocks_by_media(self, count: int = 20) -> List[NewsItem]:
-        """获取财经媒体热议股票"""
+        """获取财经媒体热议股票 (东财热门排行, 需 POST + JSON body)"""
         news_list = []
         try:
-            # 东方财富热门话题
             url = "https://emappdata.eastmoney.com/stockrank/getAllCurrentList"
-            params = {
+            body = {
                 'appId': 'appId01',
                 'globalId': '786e4c21-70dc-435a-93bb-38',
                 'marketType': '',
                 'pageNo': 1,
                 'pageSize': count
             }
-            
-            response = requests.post(url, json=params, headers=self.headers, timeout=10)
+
+            # 该接口只收 JSON body 且需 POST, em_get 是 GET 会丢 body; 用 em_post
+            response = em_post(url, body=body,
+                               headers={'Referer': 'https://emappdata.eastmoney.com/'},
+                               timeout=10)
             data = response.json()
             
             if data.get('data'):
