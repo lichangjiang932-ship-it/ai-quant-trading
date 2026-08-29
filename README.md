@@ -403,6 +403,61 @@ events = tpsl.on_quote("sh600000", 11.0)   # 触发止盈
 
 观察接口：`GET /api/market/candidates` 返回 `scanned / candidates / items`。
 
+## 收藏机制 (自选股分组 + 元数据 + 黑名单)
+
+原自选只是 config.yaml 里的一个**扁平代码列表**，有四个实际问题：
+
+1. 只能表达"我关注它"，表达不了"我在观察 / 我拉黑它"——没有黑名单，想排除某只股票
+   只能改代码；
+2. 没有元数据：为什么加的、目标价多少、什么标签，全丢失，过几周只剩一串代码；
+3. 每次增删都整体重写 config.yaml —— 冲掉注释与格式，并发写也有风险；
+4. 空列表会静默回退到 `trading.symbols`，导致"清空自选"操作不生效。
+
+改为独立 JSON 存储 `data/watchlist.json`（原子写），每条记录带分组与元数据：
+
+| 分组 | 含义 | 选股行为 |
+|------|------|---------|
+| `core` 核心池 | 人工研究过的标的 | 优先进入精筛 + **+4 分** |
+| `watch` 观察 | 只看行情 | 中性，不加权 |
+| `blacklist` 黑名单 | 踩过坑，永久排除 | **任何路径都不选入** |
+
+每条记录字段：`group / note / tags / target_price / added_at / updated_at / source`。
+首次加载自动把旧扁平列表迁移为 `core` 分组，不丢数据。
+
+> 核心池加分刻意做小（±4），不能盖过客观因子——否则自选就成了绕过风控的后门。
+
+```bash
+# 带备注与标签加入核心池
+curl -X POST localhost:8080/api/watchlist/add -H "Content-Type: application/json" \
+  -d '{"query":"贵州茅台","group":"core","note":"等回踩20日线","tags":["白酒","消费"],"target_price":1200}'
+
+# 拉黑某只踩过坑的票
+curl -X POST localhost:8080/api/watchlist/group -H "Content-Type: application/json" \
+  -d '{"symbol":"sz300750","group":"blacklist"}'
+```
+
+| 接口 | 说明 |
+|------|------|
+| `GET /api/watchlist` | 自选（已剔除黑名单）+ 实时行情 |
+| `GET /api/watchlist/entries` | 带分组与元数据的完整列表 + 分组统计 |
+| `POST /api/watchlist/add` | 加入，支持 `group / note / tags / target_price` |
+| `POST /api/watchlist/remove` | 移除 |
+| `POST /api/watchlist/group` | 调整分组（核心池/观察/黑名单） |
+
+### 选股机制消费收藏数据
+
+候选池改为**分层优先级**（因为最终会截断到 80 只，顺序决定谁被精筛）：
+
+```
+1. 当前持仓    —— 必须保留, 否则卖出逻辑无处附着
+2. 自选核心池  —— 人工研究过, 优先评估
+3. 全市场粗筛  —— 主要来源(约60只, 按成交额降序)
+4. 内置活跃池  —— 兜底
+5. AI 选股结果 —— 兜底
+        ↓
+   黑名单全局过滤(持仓除外——否则无法卖出)
+```
+
 ## 因子级反馈闭环 (让策略真的会学习)
 
 借鉴 **Vibe-Trading 因子监控** 与 **AgentQuant 信号记忆**。

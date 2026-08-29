@@ -27,7 +27,8 @@ def _normalized_symbol(code: str) -> str:
     code = _clean_stock_code(code)
     if not (code.isdigit() and len(code) == 6):
         return ""
-    if code.startswith(("4", "8")):
+    # 北交所须先判: 43/83/87/88 开头 + 920xxx 新代码段 (否则 920 → 误判沪市)
+    if code.startswith(("4", "8", "92")):
         return f"bj{code}"
     if code.startswith(("5", "6", "9")):
         return f"sh{code}"

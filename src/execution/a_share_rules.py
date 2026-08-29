@@ -19,12 +19,14 @@ def normalize_symbol(symbol: str) -> str:
     value = str(symbol or "").strip().lower()
     if value.startswith(("sh", "sz", "bj")):
         return value
+    # 北交所需优先判定: 43/83/87/88 开头, 以及 2023 年启用的 920xxx 新代码段。
+    # 若放到 6/9/5 之后, 920xxx 会被误判成沪市(9开头)。
+    if value.startswith(("4", "8", "92")):
+        return "bj" + value
     if value.startswith(("6", "9", "5")):
         return "sh" + value
     if value.startswith(("0", "3", "1")):
         return "sz" + value
-    if value.startswith(("4", "8")):
-        return "bj" + value
     return value
 
 

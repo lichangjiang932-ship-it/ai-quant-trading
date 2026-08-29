@@ -90,3 +90,9 @@ data/news_factor_validation.csv
 data/news_symbol_map.json
 data/*.json
 data/*.csv
+
+# pytest 临时目录 (指定 --basetemp 时生成)
+.pytest_tmp/
+
+# pytest 临时目录 (指定 --basetemp 时生成)
+.pytest_tmp/

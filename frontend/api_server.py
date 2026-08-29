@@ -431,6 +431,10 @@ def _normalize_symbol(s: str) -> str:
     s = s.strip()
     if s.startswith(('sh', 'sz', 'bj')):
         return s
+    # 北交所须优先判定: 43/83/87/88 开头, 以及 2023 年启用的 920xxx 新代码段。
+    # 放在 '6','9' 之后会让 920xxx 被误判为沪市(9开头) —— 全市场扫描会遇到北交所票。
+    if s.startswith(('4', '8', '92')):
+        return 'bj' + s
     if s.startswith(('6', '9')):
         return 'sh' + s
     if s.startswith('0') or s.startswith('3'):
@@ -441,8 +445,32 @@ def _normalize_symbol(s: str) -> str:
 DEFAULT_POOL = ['sh600000', 'sh600104', 'sz000001', 'sz000002']
 
 
+_watchlist_migrated = False
+
+
 def _get_watchlist() -> List[str]:
-    """自选股列表(核心池)。空则回退 trading.symbols, 再回退内置默认。"""
+    """自选股(非黑名单)列表。
+
+    收藏机制升级: 数据来自结构化存储 src/data/watchlist_store.py (分组+元数据),
+    首次调用时把 config.yaml 里的旧扁平列表迁移进去, 不丢数据。
+    为兼容既有调用方, 这里仍返回扁平代码列表(已剔除黑名单)。
+    """
+    global _watchlist_migrated
+    try:
+        from src.data import watchlist_store as ws
+        if not _watchlist_migrated:
+            _watchlist_migrated = True
+            if not ws.load_entries():
+                legacy = config.get('trading.watchlist', None)
+                if not legacy:
+                    legacy = config.get('trading.symbols', None)
+                ws.migrate_from_flat(list(legacy or []))
+        syms = ws.watch_symbols()
+        if syms:
+            return syms
+    except Exception:
+        pass
+    # 降级: 存储不可用时回退旧逻辑
     wl = config.get('trading.watchlist', None)
     if not wl:
         wl = config.get('trading.symbols', DEFAULT_POOL)
@@ -2021,19 +2049,43 @@ def get_watchlist():
 
 @app.post("/api/watchlist/add")
 def add_watchlist(body: dict):
-    """加入自选。body: {symbol} 或 {query}(名称/拼音/代码)。"""
+    """加入自选。
+
+    body:
+      symbol | query : 代码或名称/拼音
+      group  : core(核心池, 选股加权) | watch(观察) | blacklist(黑名单, 永不选)
+      note   : 备注(为什么加/什么逻辑)
+      tags   : 标签数组, 如 ["银行","低估值"]
+      target_price : 目标价
+    """
     raw = str(body.get('symbol') or body.get('query') or '').strip()
     if not raw:
         return JSONResponse({"success": False, "error": "请输入股票代码或名称"})
     sym, name = _resolve_symbol_name(raw)
     if not sym:
         return JSONResponse({"success": False, "error": f"无法识别「{raw}」"})
-    wl = _get_watchlist()
-    # 若当前自选为空回退池, 首次添加时以回退池为基础再追加
-    if sym in wl:
-        return JSONResponse({"success": True, "already": True, "symbol": sym, "name": name, "symbols": wl})
-    wl = wl + [sym]
-    saved = _save_watchlist(wl)
+
+    group = str(body.get('group') or 'core').strip().lower()
+    note = str(body.get('note') or '')[:200]
+    tags = [str(t) for t in (body.get('tags') or [])][:8]
+    try:
+        target_price = float(body.get('target_price')) if body.get('target_price') else None
+    except (TypeError, ValueError):
+        target_price = None
+
+    entry = None
+    try:
+        from src.data import watchlist_store as ws
+        entry = ws.add(sym, group=group, note=note, tags=tags,
+                       target_price=target_price, name=name)
+    except Exception:
+        entry = None
+    if entry is None:  # 降级旧逻辑
+        wl = _get_watchlist()
+        if sym not in wl:
+            wl = wl + [sym]
+            _save_watchlist(wl)
+
     # 直接带回该股行情, 前端无需再发一次 /api/quotes(去掉加自选卡顿)
     quote = {}
     try:
@@ -2042,8 +2094,10 @@ def add_watchlist(body: dict):
             broker.update_market_price(sym, float(quote['price']))
     except Exception:
         pass
-    return JSONResponse({"success": True, "symbol": sym, "name": name or quote.get('name', ''),
-                         "symbols": saved, "quote": quote})
+    return JSONResponse({
+        "success": True, "symbol": sym, "name": name or quote.get('name', ''),
+        "entry": entry, "symbols": _get_watchlist(), "quote": quote,
+    })
 
 
 @app.post("/api/watchlist/remove")
@@ -2052,9 +2106,55 @@ def remove_watchlist(body: dict):
     sym = _normalize_symbol(str(body.get('symbol', '')).strip())
     if not sym:
         return JSONResponse({"success": False, "error": "缺少 symbol"})
+    try:
+        from src.data import watchlist_store as ws
+        ws.remove(sym)
+    except Exception:
+        pass
+    # 兼容: 旧扁平列表里若还有也一并清掉
     wl = [s for s in _get_watchlist() if s != sym]
-    saved = _save_watchlist(wl)
-    return JSONResponse({"success": True, "symbol": sym, "symbols": saved})
+    _save_watchlist(wl)
+    return JSONResponse({"success": True, "symbol": sym, "symbols": _get_watchlist()})
+
+
+@app.post("/api/watchlist/group")
+def set_watchlist_group(body: dict):
+    """调整自选分组: core(核心池) / watch(观察) / blacklist(黑名单)。
+
+    黑名单的股票不会被任何选股路径选中, 用于永久排除踩过坑的标的。
+    """
+    sym = _normalize_symbol(str(body.get('symbol', '')).strip())
+    group = str(body.get('group') or '').strip().lower()
+    if not sym:
+        return JSONResponse({"success": False, "error": "缺少 symbol"})
+    try:
+        from src.data import watchlist_store as ws
+        if group not in ws.GROUPS:
+            return JSONResponse({"success": False,
+                                 "error": f"分组须为 {list(ws.GROUPS)} 之一"})
+        entry = ws.set_group(sym, group)
+        if entry is None:
+            return JSONResponse({"success": False, "error": "该股不在自选列表中"})
+        return JSONResponse({"success": True, "symbol": sym, "entry": entry,
+                             "symbols": _get_watchlist()})
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)[:200]})
+
+
+@app.get("/api/watchlist/entries")
+def watchlist_entries():
+    """带分组与元数据的完整自选列表 (供前端分组展示/编辑备注)。"""
+    try:
+        from src.data import watchlist_store as ws
+        items = []
+        for sym, e in ws.load_entries().items():
+            it = dict(e)
+            it["symbol"] = sym
+            items.append(it)
+        return JSONResponse({"success": True, "items": items,
+                             "stats": ws.stats(), "groups": list(ws.GROUPS)})
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)[:200], "items": []})
 
 
 @app.get("/api/kline")
@@ -4725,59 +4825,86 @@ def _autotrade_held_days(symbol: str) -> int:
 
 
 def _autotrade_candidate_pool() -> List[str]:
-    """候选池 = 当前持仓 + 全市场粗筛漏斗 + 内置活跃池 + 自选 + AI选股。
+    """候选池 (分层优先级 + 黑名单过滤)。
 
-    关键改造 (原实现硬截断 16 只, 是选股路径的最大瓶颈):
-    原候选只来自"内置活跃池(约16~30只) + 自选 + AI选股", 在 5000+ 只 A 股里
-    只看十几只 —— 导致反复在同一批票里进出(某白酒龙头3次全亏), 以及行情好时
-    "一天选不到股票"。现改为两级漏斗:
-      ① 全市场粗筛 (纯 HTTP 快照, 便宜): 5000+ → 按流动性/市值/换手/涨幅
-         硬过滤 → 约 60 只, 涨跌都覆盖(按成交额排序, 保留回调中的买点)
-      ② 精筛 (现有 _autotrade_buy_screen, 昂贵: 拉K线+多因子+LLM)
-    持仓永远优先保留, 保证卖出逻辑不被漏斗挤掉。
+    两级漏斗:
+      ① 粗筛 (纯 HTTP 快照, 便宜): 全市场 5000+ → 约 60 只
+      ② 精筛 (_autotrade_buy_screen, 昂贵: 拉K线 + 多因子 + LLM)
+
+    分层优先级 (越靠前越先被精筛, 因为最终会截断到 MAX_CANDIDATES):
+      1. 当前持仓      —— 必须保留, 否则卖出逻辑无处附着
+      2. 自选核心池    —— 人工研究过的标的, 优先评估
+      3. 全市场粗筛    —— 主要来源, 按成交额降序
+      4. 内置活跃池    —— 兜底
+      5. AI 选股结果   —— 兜底
+
+    黑名单 (watchlist_store group=blacklist) 在最后统一过滤:
+    无论出现在哪一层都会被剔除, 用于永久排除踩过坑的标的。
     """
-    syms: List[str] = []
-    held: set = set()
+    MAX_CANDIDATES = 80
+    held: List[str] = []
+    held_set: set = set()
     try:
         for p in broker.get_positions():
-            s = getattr(p, 'symbol', '')
-            if s:
-                held.add(s)
-                if s not in syms:
-                    syms.append(s)
+            s = _normalize_symbol(getattr(p, 'symbol', ''))
+            if s and s not in held_set:
+                held_set.add(s)
+                held.append(s)
     except Exception:
         pass
 
-    extra: List[str] = []
-    # ① 全市场粗筛漏斗 (主要来源)
+    # 自选核心池 (人工研究过, 优先评估)
+    core: List[str] = []
+    try:
+        from src.data import watchlist_store as ws
+        core = [s for s in ws.list_group('core')]
+    except Exception:
+        core = []
+
+    # 全市场粗筛漏斗
+    scanned: List[str] = []
     try:
         from src.analysis.market_scanner import scan_candidates, load_prefilter_config
         _pf_cfg = load_prefilter_config(config.get('autotrade', {}) or {})
-        for row in scan_candidates(_pf_cfg):
-            s = _normalize_symbol(str(row.get('symbol', '')))
-            if s:
-                extra.append(s)
-        _autotrade_log(f"全市场粗筛: 得到 {len(extra)} 只候选", "muted")
+        scanned = [_normalize_symbol(str(r.get('symbol', '')))
+                   for r in scan_candidates(_pf_cfg)]
+        _autotrade_log(f"全市场粗筛: 得到 {len(scanned)} 只候选", "muted")
     except Exception as e:
         _autotrade_log(f"全市场粗筛不可用({type(e).__name__}), 回退内置池", "warn")
 
-    # ② 内置活跃池 + 自选股 + 最近 AI 选股 (兜底与人工偏好)
-    extra.extend(list(AUTOTRADE_CANDIDATES) + list(_get_watchlist() or []))
+    # 兜底层: 内置活跃池 + AI 选股
+    fallback: List[str] = list(AUTOTRADE_CANDIDATES)
     try:
         with _scan_lock:
             for pick in (_scan_job.get("picks") or []):
                 s = _normalize_symbol(str(pick.get("symbol", "")))
                 if s:
-                    extra.append(s)
+                    fallback.append(s)
     except Exception:
         pass
 
-    for s in extra:
+    # 黑名单全局过滤
+    blocked: set = set()
+    try:
+        from src.data import watchlist_store as ws
+        blocked = set(ws.blacklist())
+        if blocked:
+            _autotrade_log(f"黑名单生效: 排除 {len(blocked)} 只", "muted")
+    except Exception:
+        pass
+
+    ordered: List[str] = []
+    seen: set = set()
+    for s in (held + core + scanned + fallback):
         s = _normalize_symbol(s)
-        if s and s not in held and s not in syms:
-            syms.append(s)
-    # 持仓 + 全市场候选 + 兜底池; 上限放宽到 80 (漏斗已按成交额排序, 前列最活跃)
-    return syms[:80]
+        if not s or s in seen:
+            continue
+        # 持仓永远保留(不因黑名单被剔, 否则无法卖出); 其余遇黑名单跳过
+        if s in blocked and s not in held_set:
+            continue
+        seen.add(s)
+        ordered.append(s)
+    return ordered[:MAX_CANDIDATES]
 
 
 def _autotrade_log(msg: str, kind: str = "info"):
@@ -5028,6 +5155,18 @@ def _autotrade_buy_screen(symbol: str, opp: Dict, dq: Dict, regime: Dict,
         if _fa.get("adjust"):
             comp += float(_fa["adjust"])
             factors["factor_feedback"] = _fa
+    except Exception:
+        pass
+
+    # 11. 自选分组加权: 核心池(人工研究过)小幅加分。
+    # 幅度刻意做小(±4), 不能盖过客观因子 —— 否则自选就成了绕过风控的后门。
+    # 黑名单在候选池阶段已直接剔除, 这里无需处理。
+    try:
+        from src.data import watchlist_store as ws
+        _wl_adj = ws.buy_adjust(symbol)
+        if _wl_adj:
+            comp += _wl_adj
+            factors["watchlist_adjust"] = _wl_adj
     except Exception:
         pass
 
