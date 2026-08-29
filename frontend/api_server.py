@@ -4611,6 +4611,102 @@ AUTOTRADE_CANDIDATES: List[str] = [
 ]
 
 
+def _evaluate_buy_outcome(symbol: str, buy_date: str, buy_price: float,
+                          eval_days: int = 2) -> str:
+    """买入的前向结果判定: 买入后第 eval_days 个交易日的收盘价 vs 买入价。
+
+    返回 "买对" / "买错", 或 "" 表示窗口未走完(数据不足), 该笔暂不打标 ——
+    留到下一个复盘日再评估, 避免用"当日涨跌"这种过短视界给因子喂错误信号。
+    """
+    if not symbol or buy_price <= 0:
+        return ""
+    try:
+        df = _load_daily_frame(symbol, 120)
+    except Exception:
+        return ""
+    if df is None or df.empty or "Close" not in df.columns:
+        return ""
+    try:
+        idx = [d.strftime("%Y-%m-%d") for d in df.index]
+    except Exception:
+        return ""
+    # 找到买入日之后的第 eval_days 根 K 线 (买入日之后, 不含买入日)
+    pos = None
+    for i, d in enumerate(idx):
+        if d >= str(buy_date):
+            pos = i
+            break
+    if pos is None:
+        return ""  # 买入日还没进历史数据, 暂不评估
+    target = pos + int(eval_days)
+    if target >= len(idx):
+        return ""  # 窗口未走完, 留给之后的复盘日
+    try:
+        future_close = float(df["Close"].iloc[target])
+    except (IndexError, TypeError, ValueError):
+        return ""
+    if future_close <= 0:
+        return ""
+    return "买对" if future_close >= buy_price else "买错"
+
+
+def _autotrade_active_factors(f: Dict) -> List[str]:
+    """从买入筛选结果里提炼"本次真正触发的因子标签", 供因子级反馈闭环统计。
+
+    每个标签都要是**可归因、可重复出现**的离散事件, 否则统计不出有效胜率
+    (原来只有"普通信号/高评分"三种粗标签, 记了也学不到东西)。
+    """
+    tags: List[str] = []
+    if not f:
+        return tags
+    # 资金面
+    if f.get('flow_direction') == 'inflow':
+        tags.append('资金净流入')
+    elif f.get('flow_direction') == 'outflow':
+        tags.append('资金净流出')
+    # 趋势强度
+    ts = f.get('trend_strength')
+    if ts == 2:
+        tags.append('强趋势')
+    elif ts == 1:
+        tags.append('弱趋势')
+    # 新闻
+    if f.get('news_direction') == 'bull':
+        tags.append('新闻利好')
+    elif f.get('news_direction') == 'bear':
+        tags.append('新闻利空')
+    if f.get('news_chase'):
+        tags.append('新闻追高')
+    # 威科夫量价阶段
+    wp = f.get('wyckoff_phase')
+    if wp and wp != 'unknown':
+        tags.append(f'威科夫_{wp}')
+    # 技术因子 (取 alpha_notes 里的关键结论, 用顿号分隔)
+    notes = str(f.get('alpha_notes') or '')
+    for key in ('回踩', '追顶', '位置偏高', '位置健康', '放量突破', '放量上攻',
+                '缩量阴跌', '超卖', '超买', 'MACD多头', 'MACD空头'):
+        if key in notes:
+            tags.append(key)
+    # 评分档位 (粗粒度, 作为兜底维度)
+    try:
+        sc = float(f.get('score') or 0)
+        if sc >= 75:
+            tags.append('高评分75+')
+        elif sc >= 65:
+            tags.append('评分65-75')
+        else:
+            tags.append('评分60-65')
+    except (TypeError, ValueError):
+        pass
+    # 去重保序
+    seen, out = set(), []
+    for t in tags:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
 def _autotrade_held_days(symbol: str) -> int:
     """该持仓已持有多少自然日 (按最近一次买入日期计算)。
 
@@ -4922,6 +5018,18 @@ def _autotrade_buy_screen(symbol: str, opp: Dict, dq: Dict, regime: Dict,
         comp -= 8
     if rr >= 2.0:
         comp += 4
+
+    # 10. 因子级反馈闭环 (借鉴 Vibe-Trading 因子监控 / AgentQuant 信号记忆):
+    # 本次触发的每个因子, 若历史(同因子)样本足够且胜率差, 则扣分; 胜率优则加分。
+    # 这让"曾经好用后来失效"的因子自动失去话语权 —— 原实现只记不学。
+    try:
+        from src.analysis.strategy_memory import factor_adjustment
+        _fa = factor_adjustment(_autotrade_active_factors(factors))
+        if _fa.get("adjust"):
+            comp += float(_fa["adjust"])
+            factors["factor_feedback"] = _fa
+    except Exception:
+        pass
 
     passed = not reject and price > 0
     return {
@@ -5312,6 +5420,17 @@ def _autotrade_cycle_impl():
                                        + news_part + f" | {reason[:35]}"),
                             "order_id": payload.get('order_id', ''),
                         })
+                        # 因子级反馈闭环: 买入时把本次触发的因子逐条落库(待定),
+                        # 复盘打标后回填胜负 → 每个因子积累自己的历史胜率
+                        try:
+                            from src.analysis.strategy_memory import record_factor_evidence
+                            record_factor_evidence(
+                                now.strftime("%Y-%m-%d"), symbol, "buy",
+                                _autotrade_active_factors(f), name=name,
+                                reason=str(f.get('alpha_notes', ''))[:100],
+                            )
+                        except Exception:
+                            pass
                         bought.append(symbol)
                         room_amount -= qty * price
                         _trailing_highs[symbol] = price  # 追踪止损从买价起算
@@ -5683,13 +5802,22 @@ def _build_daily_review(target_date: Optional[str] = None):
     last_prices = {}
     for p in positions:
         last_prices[getattr(p, 'symbol', '')] = float(getattr(p, 'last_price', 0) or 0)
+    # 买入的前向评估窗口: 与 min_hold_days 对齐且更完整。
+    # 原实现用"当日收盘价"给买入打标 —— 当天跌一点就判'买错', 哪怕持有2天后
+    # 涨回来。这会把"持有过短"的偏差喂回因子统计, 让闭环学到错误教训。
+    try:
+        eval_days = int(config.get('autotrade.protections.min_hold_days', 2) or 2)
+    except (TypeError, ValueError):
+        eval_days = 2
+    eval_days = max(eval_days, 2)  # 至少 2 个交易日, 与最短持有期一致
     for t in trades:
         sym = t.get('symbol', '')
         px = float(t.get('filled_price', 0) or t.get('price', 0) or 0)
         side = t.get('side', '')
-        ref = last_prices.get(sym, px) or px  # 用当前价判断结果 (收盘复盘近似)
+        ref = last_prices.get(sym, px) or px  # 当前价, 仅用于卖出判定
         if side == 'buy' and px > 0:
-            label = "买对" if ref >= px else "买错"
+            # 前向窗口: 买入后第 eval_days 个交易日的收盘价 vs 买入价
+            label = _evaluate_buy_outcome(sym, t.get('date', today), px, eval_days)
         elif side == 'sell' and px > 0:
             label = "卖对" if ref <= px else "卖飞"  # 卖出后继续跌=对, 反弹=飞
         else:
@@ -5756,6 +5884,18 @@ def _build_daily_review(target_date: Optional[str] = None):
                     "reason": reason,
                 })
             record_evidence(evidence)
+            # 因子级闭环: 把该笔交易所有 pending 因子证据回填为实际结果,
+            # 于是每个因子积累出自己的历史胜率, 供后续买入决策加减分
+            try:
+                from src.analysis.strategy_memory import resolve_factor_evidence
+                for t in trades:
+                    lbl = t.get('result_label', '')
+                    if lbl:
+                        resolve_factor_evidence(
+                            today, t.get('symbol', ''), t.get('side', ''),
+                            lbl, float(t.get('pnl', 0) or 0))
+            except Exception:
+                pass
         except Exception:
             pass
     except Exception as e:
@@ -5900,6 +6040,39 @@ def metrics():
                                       "trades": dict(_trading_counters)}})
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)})
+
+
+@app.get("/api/memory/factors")
+def memory_factors_api(days: Optional[int] = None, min_samples: int = 3):
+    """因子级有效性统计 (因子反馈闭环的可观测入口)。
+
+    返回每个因子: 样本数 / 胜 / 负 / 胜率 / 累计盈亏,
+    并按"已达标(样本足够) → 样本多"排序, 便于看清哪些因子在持续失效。
+    """
+    try:
+        from src.analysis.strategy_memory import factor_stats
+        stats = factor_stats(days)
+        items = []
+        for name, g in stats.items():
+            items.append({
+                "factor": name,
+                "samples": g.get("samples", 0),
+                "wins": g.get("wins", 0),
+                "losses": g.get("losses", 0),
+                "win_rate": g.get("win_rate", 0),
+                "pnl": g.get("pnl", 0),
+                "effective": g.get("samples", 0) >= max(int(min_samples or 3), 1),
+            })
+        items.sort(key=lambda x: (not x["effective"], -x["samples"]))
+        return JSONResponse({
+            "success": True,
+            "min_samples": max(int(min_samples or 3), 1),
+            "total_factors": len(items),
+            "effective_factors": sum(1 for i in items if i["effective"]),
+            "items": items,
+        })
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)[:200], "items": []})
 
 
 @app.get("/api/memory/signals")
